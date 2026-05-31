@@ -1,5 +1,10 @@
 # Warpgate
 
+![Language](https://img.shields.io/badge/language-Rux-blueviolet)
+![Version](https://img.shields.io/badge/version-0.1.0-blue)
+![Platform](https://img.shields.io/badge/platform-Windows-lightgrey?logo=windows)
+![License](https://img.shields.io/badge/license-MIT-green)
+
 A self-hosted HTTP edge runtime written in [Rux](https://rux-lang.org), targeting Windows with zero stdlib dependencies (Win32/Winsock2 FFI only).
 
 Use Warpgate as a **library** — bring your own request handler, configure the rest via `warpgate.toml`.
