@@ -1,0 +1,828 @@
+// Warpgate — TLS client via Windows SChannel
+//
+// Provides a thin wrapper around the SChannel SSPI API for outbound TLS
+// connections (proxy → upstream HTTPS).  Inbound TLS (client → warpgate)
+// is not yet implemented.
+//
+// ── Memory layout notes ──────────────────────────────────────────────────────
+//
+// SecHandle  (SSPI credential / context handle): 16 bytes (two ULONG_PTR).
+// SecBuffer  : { cbBuffer: u32, BufferType: u32, pvBuffer: ptr } = 16 bytes.
+// SecBufferDesc : { ulVersion: u32, cBuffers: u32, pBuffers: ptr } = 16 bytes.
+// StreamSizes : 5 × u32 = 20 bytes.
+// SCHANNEL_CRED : 80 bytes (see Ffi.rux comment for layout).
+//
+// We represent handles as pairs of int (pointer-sized on Win64).
+//
+// ── TlsConn ──────────────────────────────────────────────────────────────────
+
+struct TlsConn {
+    sock:         int,
+
+    // Credential handle (AcquireCredentialsHandle output)
+    cred_lower:   int,
+    cred_upper:   int,
+
+    // Context handle (InitializeSecurityContext output)
+    ctx_lower:    int,
+    ctx_upper:    int,
+
+    // Stream sizes from QueryContextAttributes
+    hdr_size:     uint32,
+    trl_size:     uint32,
+    max_msg:      uint32,
+
+    initialized:  bool,
+
+    // Leftover undecrypted bytes from the last DecryptMessage call
+    // (SECBUFFER_EXTRA from the previous call must be fed back next time).
+    extra_buf:    [char8; 8192],
+    extra_len:    int,
+}
+
+func EmptyTlsConn(sock: int) -> TlsConn {
+    return TlsConn {
+        sock:        sock,
+        cred_lower:  0,
+        cred_upper:  0,
+        ctx_lower:   0,
+        ctx_upper:   0,
+        hdr_size:    0,
+        trl_size:    0,
+        max_msg:     0,
+        initialized: false,
+        extra_buf:   [0; 8192],
+        extra_len:   0,
+    };
+}
+
+// ── SecHandle / SecBuffer helpers ─────────────────────────────────────────────
+
+// Writes a SecHandle into a 16-byte buffer.
+func WriteSecHandle(buf: *char8, lower: int, upper: int) {
+    // Little-endian pointer write
+    var i: int = 0;
+    var v: int = lower;
+    loop {
+        if i >= 8 { break; }
+        buf[i] = (v & 0xFF) as char8;
+        v = v >> 8;
+        i = i + 1;
+    }
+    i = 0;
+    v = upper;
+    loop {
+        if i >= 8 { break; }
+        buf[8 + i] = (v & 0xFF) as char8;
+        v = v >> 8;
+        i = i + 1;
+    }
+}
+
+// Reads a SecHandle from a 16-byte buffer, fills lower/upper.
+func ReadSecHandle(buf: *char8, lower: *int, upper: *int) {
+    lower[0] = ReadPtrAt(buf as int, 0);
+    upper[0] = ReadPtrAt(buf as int, 8);
+}
+
+// Writes a SecBuffer into buf[0..16).
+func WriteSecBuffer(buf: *char8, cb: uint32, buf_type: uint32, pv: int) {
+    // cbBuffer  (uint32, offset 0)
+    buf[0] = (cb & 0xFF) as char8;
+    buf[1] = ((cb >> 8)  & 0xFF) as char8;
+    buf[2] = ((cb >> 16) & 0xFF) as char8;
+    buf[3] = ((cb >> 24) & 0xFF) as char8;
+    // BufferType (uint32, offset 4)
+    buf[4] = (buf_type & 0xFF) as char8;
+    buf[5] = ((buf_type >> 8)  & 0xFF) as char8;
+    buf[6] = ((buf_type >> 16) & 0xFF) as char8;
+    buf[7] = ((buf_type >> 24) & 0xFF) as char8;
+    // pvBuffer (ptr, offset 8)
+    var i: int = 0;
+    var v: int = pv;
+    loop {
+        if i >= 8 { break; }
+        buf[8 + i] = (v & 0xFF) as char8;
+        v = v >> 8;
+        i = i + 1;
+    }
+}
+
+// Reads cbBuffer from a SecBuffer at buf[0..16).
+func ReadSecBufCb(buf: *char8) -> uint32 {
+    return ReadU32At(buf as int, 0);
+}
+
+// Reads BufferType from a SecBuffer.
+func ReadSecBufType(buf: *char8) -> uint32 {
+    return ReadU32At(buf as int, 4);
+}
+
+// Reads pvBuffer pointer from a SecBuffer.
+func ReadSecBufPv(buf: *char8) -> int {
+    return ReadPtrAt(buf as int, 8);
+}
+
+// Writes a SecBufferDesc into buf[0..16).
+func WriteSecBufDesc(buf: *char8, version: uint32, c_bufs: uint32, p_bufs: int) {
+    buf[0] = (version & 0xFF) as char8;
+    buf[1] = ((version >> 8) & 0xFF) as char8;
+    buf[2] = 0 as char8;
+    buf[3] = 0 as char8;
+    buf[4] = (c_bufs & 0xFF) as char8;
+    buf[5] = ((c_bufs >> 8) & 0xFF) as char8;
+    buf[6] = 0 as char8;
+    buf[7] = 0 as char8;
+    var i: int = 0;
+    var v: int = p_bufs;
+    loop {
+        if i >= 8 { break; }
+        buf[8 + i] = (v & 0xFF) as char8;
+        v = v >> 8;
+        i = i + 1;
+    }
+}
+
+// ── Handshake ─────────────────────────────────────────────────────────────────
+
+// Performs the full TLS client handshake on tls.sock.
+// hostname is used for SNI and certificate validation.
+// Returns true on success.
+func TlsConnect(tls: *TlsConn, hostname: *char8) -> bool {
+    // ── Step 1: Acquire credentials ──────────────────────────────────────────
+    // SCHANNEL_CRED: 80 bytes zero-initialised; only dwVersion (offset 0) = 4.
+    var sc_cred: [char8; 80] = [0; 80];
+    sc_cred[0] = SCHANNEL_CRED_VERSION as char8;
+
+    var cred_handle: [char8; 16] = [0; 16];
+    let unisp = c8"Microsoft Unified Security Protocol Provider";
+    let acq_rc = AcquireCredentialsHandleA(
+        0 as *char8,       // principal (null)
+        unisp.data,
+        SECPKG_CRED_OUTBOUND,
+        0 as *opaque,      // logon id
+        &sc_cred as *opaque,
+        0 as *opaque,      // GetKeyFn
+        0 as *opaque,      // GetKeyArg
+        &cred_handle as *opaque,
+        0 as *opaque);     // expiry
+
+    if acq_rc != SEC_E_OK {
+        LogStr(c8"[tls] AcquireCredentialsHandle failed\n".data);
+        return false;
+    }
+
+    ReadSecHandle(&cred_handle as *char8, &tls.cred_lower, &tls.cred_upper);
+
+    // ── Step 2: Handshake loop ────────────────────────────────────────────────
+    // Output buffer: one token buffer (SSPI allocates via ISC_REQ_ALLOCATE_MEMORY).
+    var out_sec_buf:  [char8; 16] = [0; 16];  // one SecBuffer
+    var out_sec_desc: [char8; 16] = [0; 16];  // SecBufferDesc
+
+    WriteSecBuffer(&out_sec_buf as *char8, 0, SECBUFFER_TOKEN, 0);
+    WriteSecBufDesc(&out_sec_desc as *char8, SECBUFFER_VERSION, 1,
+                    &out_sec_buf as *char8 as int);
+
+    var ctx_handle: [char8; 16] = [0; 16];
+    var ctx_attrs:  uint32 = 0;
+    var first_call: bool = true;
+
+    // Input buffer storage (reused each iteration after the first).
+    var in_data:     [char8; 32768] = [0; 32768];
+    var in_data_len: int = 0;
+
+    // Two input SecBuffers: one for the token, one EMPTY.
+    var in_sec_bufs: [char8; 32] = [0; 32];   // 2 × 16 bytes
+    var in_sec_desc: [char8; 16] = [0; 16];
+
+    loop {
+        // Reset output buffer (SSPI will fill it or leave pvBuffer = null).
+        WriteSecBuffer(&out_sec_buf as *char8, 0, SECBUFFER_TOKEN, 0);
+        WriteSecBufDesc(&out_sec_desc as *char8, SECBUFFER_VERSION, 1,
+                        &out_sec_buf as *char8 as int);
+
+        let in_desc_ptr: int =
+            if first_call { 0 }
+            else {
+                WriteSecBuffer(&in_sec_bufs as *char8,
+                               in_data_len as uint32, SECBUFFER_TOKEN,
+                               &in_data as *char8 as int);
+                WriteSecBuffer(&in_sec_bufs as *char8 + 16,
+                               0, SECBUFFER_EMPTY, 0);
+                WriteSecBufDesc(&in_sec_desc as *char8, SECBUFFER_VERSION, 2,
+                                &in_sec_bufs as *char8 as int);
+                &in_sec_desc as *char8 as int
+            };
+
+        let ctx_in_ptr: int =
+            if first_call { 0 }
+            else { &ctx_handle as *char8 as int };
+
+        let isc_rc = InitializeSecurityContextA(
+            &cred_handle as *opaque,
+            ctx_in_ptr as *opaque,
+            hostname,
+            ISC_REQ_FLAGS,
+            0,
+            SECURITY_NATIVE_DREP,
+            in_desc_ptr as *opaque,
+            0,
+            &ctx_handle as *opaque,
+            &out_sec_desc as *opaque,
+            &ctx_attrs,
+            0 as *opaque);
+
+        first_call = false;
+
+        // Send the output token if SSPI produced one.
+        let out_pv  = ReadSecBufPv(&out_sec_buf as *char8);
+        let out_cb  = ReadSecBufCb(&out_sec_buf as *char8);
+        if out_pv != 0 && out_cb > 0 {
+            var sent: int = 0;
+            loop {
+                if sent >= out_cb as int { break; }
+                let n = send(tls.sock, out_pv as *char8 + sent,
+                             out_cb as int - sent, 0);
+                if n <= 0 { break; }
+                sent = sent + n;
+            }
+            FreeContextBuffer(out_pv as *opaque);
+        }
+
+        if isc_rc == SEC_E_OK {
+            break;
+        }
+
+        if isc_rc != SEC_I_CONTINUE_NEEDED {
+            LogStr(c8"[tls] InitializeSecurityContext failed\n".data);
+            FreeCredentialsHandle(&cred_handle as *opaque);
+            return false;
+        }
+
+        // Receive server's next handshake message.
+        MemZero(&in_data as *char8, 32768);
+        in_data_len = 0;
+        loop {
+            let n = recv(tls.sock,
+                         &in_data as *char8 + in_data_len,
+                         32768 - in_data_len, 0);
+            if n <= 0 { break; }
+            in_data_len = in_data_len + n;
+            // Stop reading once we have data; ISC will ask for more if needed.
+            break;
+        }
+
+        if in_data_len == 0 {
+            LogStr(c8"[tls] handshake recv got 0 bytes\n".data);
+            FreeCredentialsHandle(&cred_handle as *opaque);
+            return false;
+        }
+    }
+
+    ReadSecHandle(&ctx_handle as *char8, &tls.ctx_lower, &tls.ctx_upper);
+
+    // ── Step 3: Query stream sizes ────────────────────────────────────────────
+    // StreamSizes: 5 × uint32 = 20 bytes.
+    var sizes: [char8; 20] = [0; 20];
+    let qa_rc = QueryContextAttributesA(
+        &ctx_handle as *opaque,
+        SECPKG_ATTR_STREAM_SIZES,
+        &sizes as *opaque);
+
+    if qa_rc != SEC_E_OK {
+        LogStr(c8"[tls] QueryContextAttributes failed\n".data);
+        return false;
+    }
+
+    tls.hdr_size = ReadU32At(&sizes as *char8 as int, 0);
+    tls.trl_size = ReadU32At(&sizes as *char8 as int, 4);
+    tls.max_msg  = ReadU32At(&sizes as *char8 as int, 8);
+    tls.initialized = true;
+
+    return true;
+}
+
+// ── TlsSend ───────────────────────────────────────────────────────────────────
+
+// Encrypts and sends plaintext data[0..len) over the TLS connection.
+// Returns the number of plaintext bytes sent, or -1 on error.
+func TlsSend(tls: *TlsConn, data: *char8, len: int) -> int {
+    if !tls.initialized { return -1; }
+
+    var ctx_handle: [char8; 16] = [0; 16];
+    WriteSecHandle(&ctx_handle as *char8, tls.ctx_lower, tls.ctx_upper);
+
+    var offset: int = 0;
+    loop {
+        if offset >= len { break; }
+
+        var chunk: int = len - offset;
+        if chunk > tls.max_msg as int { chunk = tls.max_msg as int; }
+
+        let total = tls.hdr_size as int + chunk + tls.trl_size as int;
+        let buf   = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                              total as uint64) as *char8;
+        if buf == 0 as *char8 { return -1; }
+
+        // Layout: [header space][plaintext][trailer space]
+        let hdr_ptr = buf;
+        let dat_ptr = buf + tls.hdr_size as int;
+        let trl_ptr = dat_ptr + chunk;
+
+        MemCopy(dat_ptr, data + offset, chunk);
+
+        // SecBuffers: header | data | trailer
+        var sec_bufs: [char8; 48] = [0; 48];  // 3 × 16
+        WriteSecBuffer(&sec_bufs as *char8 + 0,
+                       tls.hdr_size, SECBUFFER_STREAM_HEADER, hdr_ptr as int);
+        WriteSecBuffer(&sec_bufs as *char8 + 16,
+                       chunk as uint32, SECBUFFER_DATA, dat_ptr as int);
+        WriteSecBuffer(&sec_bufs as *char8 + 32,
+                       tls.trl_size, SECBUFFER_STREAM_TRAILER, trl_ptr as int);
+
+        var sec_desc: [char8; 16] = [0; 16];
+        WriteSecBufDesc(&sec_desc as *char8, SECBUFFER_VERSION, 3,
+                        &sec_bufs as *char8 as int);
+
+        let enc_rc = EncryptMessage(&ctx_handle as *opaque, 0,
+                                    &sec_desc as *opaque, 0);
+
+        if enc_rc != SEC_E_OK {
+            HeapFree(GetProcessHeap(), 0, buf as *opaque);
+            return -1;
+        }
+
+        // Actual encrypted sizes are updated in the SecBuffers.
+        let real_hdr = ReadSecBufCb(&sec_bufs as *char8 + 0);
+        let real_dat = ReadSecBufCb(&sec_bufs as *char8 + 16);
+        let real_trl = ReadSecBufCb(&sec_bufs as *char8 + 32);
+        let enc_total = real_hdr as int + real_dat as int + real_trl as int;
+
+        var sent: int = 0;
+        loop {
+            if sent >= enc_total { break; }
+            let n = send(tls.sock, buf + sent, enc_total - sent, 0);
+            if n <= 0 {
+                HeapFree(GetProcessHeap(), 0, buf as *opaque);
+                return -1;
+            }
+            sent = sent + n;
+        }
+
+        HeapFree(GetProcessHeap(), 0, buf as *opaque);
+        offset = offset + chunk;
+    }
+
+    return len;
+}
+
+// ── TlsRecv ───────────────────────────────────────────────────────────────────
+
+// Decrypts received TLS data into dst[0..cap).
+// Returns number of plaintext bytes written, 0 on clean close, -1 on error.
+func TlsRecv(tls: *TlsConn, dst: *char8, cap: int) -> int {
+    if !tls.initialized { return -1; }
+
+    var ctx_handle: [char8; 16] = [0; 16];
+    WriteSecHandle(&ctx_handle as *char8, tls.ctx_lower, tls.ctx_upper);
+
+    // Accumulated ciphertext: leftover from last call + fresh recv.
+    var cipher: [char8; 32768] = [0; 32768];
+    var cipher_len: int = 0;
+
+    // Copy leftover bytes from previous call.
+    if tls.extra_len > 0 {
+        MemCopy(&cipher as *char8, &tls.extra_buf as *char8, tls.extra_len);
+        cipher_len = tls.extra_len;
+        tls.extra_len = 0;
+    }
+
+    // Receive more ciphertext if buffer is empty.
+    if cipher_len == 0 {
+        let n = recv(tls.sock, &cipher as *char8, 32768, 0);
+        if n <= 0 { return n; }
+        cipher_len = n;
+    }
+
+    // Decrypt loop — may need multiple calls if a record spans recvs.
+    loop {
+        // Four input SecBuffers: [data | empty | empty | empty]
+        var sec_bufs: [char8; 64] = [0; 64];  // 4 × 16
+        WriteSecBuffer(&sec_bufs as *char8 + 0,
+                       cipher_len as uint32, SECBUFFER_DATA,
+                       &cipher as *char8 as int);
+        WriteSecBuffer(&sec_bufs as *char8 + 16, 0, SECBUFFER_EMPTY, 0);
+        WriteSecBuffer(&sec_bufs as *char8 + 32, 0, SECBUFFER_EMPTY, 0);
+        WriteSecBuffer(&sec_bufs as *char8 + 48, 0, SECBUFFER_EMPTY, 0);
+
+        var sec_desc: [char8; 16] = [0; 16];
+        WriteSecBufDesc(&sec_desc as *char8, SECBUFFER_VERSION, 4,
+                        &sec_bufs as *char8 as int);
+
+        let dec_rc = DecryptMessage(&ctx_handle as *opaque,
+                                    &sec_desc as *opaque, 0, 0 as *uint32);
+
+        // SEC_E_INCOMPLETE_MESSAGE: need more ciphertext bytes.
+        if (dec_rc as uint32) == SEC_E_INCOMPLETE_MESSAGE {
+            let n = recv(tls.sock,
+                         &cipher as *char8 + cipher_len,
+                         32768 - cipher_len, 0);
+            if n <= 0 { return -1; }
+            cipher_len = cipher_len + n;
+            continue;
+        }
+
+        if dec_rc != SEC_E_OK {
+            return -1;
+        }
+
+        // Find SECBUFFER_DATA and SECBUFFER_EXTRA among the four output buffers.
+        var plaintext_ptr: int = 0;
+        var plaintext_len: int = 0;
+
+        var j: int = 0;
+        loop {
+            if j >= 4 { break; }
+            let sb = &sec_bufs as *char8 + (j * 16);
+            let btype = ReadSecBufType(sb);
+            if btype == SECBUFFER_DATA {
+                plaintext_ptr = ReadSecBufPv(sb);
+                plaintext_len = ReadSecBufCb(sb) as int;
+            }
+            if btype == SECBUFFER_EXTRA {
+                // Leftover encrypted bytes — save for next call.
+                let extra_ptr = ReadSecBufPv(sb);
+                let extra_cb  = ReadSecBufCb(sb) as int;
+                if extra_cb > 0 && extra_cb <= 8192 {
+                    MemCopy(&tls.extra_buf as *char8, extra_ptr as *char8, extra_cb);
+                    tls.extra_len = extra_cb;
+                }
+            }
+            j = j + 1;
+        }
+
+        if plaintext_ptr != 0 && plaintext_len > 0 {
+            var copy: int = plaintext_len;
+            if copy > cap { copy = cap; }
+            MemCopy(dst, plaintext_ptr as *char8, copy);
+            return copy;
+        }
+
+        return 0;
+    }
+}
+
+// ── TlsClose ──────────────────────────────────────────────────────────────────
+
+func TlsClose(tls: *TlsConn) {
+    if tls.initialized {
+        var ctx_handle: [char8; 16] = [0; 16];
+        WriteSecHandle(&ctx_handle as *char8, tls.ctx_lower, tls.ctx_upper);
+        DeleteSecurityContext(&ctx_handle as *opaque);
+    }
+    if tls.cred_lower != 0 || tls.cred_upper != 0 {
+        var cred_handle: [char8; 16] = [0; 16];
+        WriteSecHandle(&cred_handle as *char8, tls.cred_lower, tls.cred_upper);
+        FreeCredentialsHandle(&cred_handle as *opaque);
+    }
+    tls.initialized = false;
+}
+
+// ── ALPN negotiation query ────────────────────────────────────────────────────
+
+// After TlsServerAccept, query what application protocol was negotiated (ALPN).
+// Fills out[0..return_value) with the protocol name string (e.g. "h2", "http/1.1").
+// Returns the length of the negotiated protocol, or 0 if none.
+func TlsGetAlpn(ctx_lower: int, ctx_upper: int, out: *char8, out_cap: int) -> int {
+    var ctx_handle: [char8; 16] = [0; 16];
+    WriteSecHandle(&ctx_handle as *char8, ctx_lower, ctx_upper);
+
+    // SecPkgContext_ApplicationProtocol: { ProtocolId[2], ProtoSize[2], Proto[255] }
+    // Total: 258 bytes (+ padding → 260 bytes for safety)
+    var app_proto: [char8; 260] = [0; 260];
+    let rc = QueryContextAttributesA(&ctx_handle as *opaque,
+                                      SECPKG_ATTR_APPLICATION_PROTOCOL,
+                                      &app_proto as *opaque);
+    if rc != SEC_E_OK { return 0; }
+
+    // ProtocolId is at offset 0 (uint16), ProtoSize at offset 2 (uint16),
+    // ProtoName at offset 4 (byte array of ProtoSize length).
+    let proto_size = ReadU32At(&app_proto as *char8 as int, 2) as int & 0xFFFF;
+    if proto_size <= 0 || proto_size > out_cap { return 0; }
+    MemCopy(out, &app_proto as *char8 + 4, proto_size);
+    return proto_size;
+}
+
+// ── Connection send/recv wrappers (plain or TLS) ──────────────────────────────
+//
+// tls == 0 as *opaque  →  plain TCP (send/recv)
+// tls != 0             →  TLS (TlsSend/TlsRecv via cast to *TlsConn)
+
+func ConnSend(sock: int, tls: *opaque, buf: *char8, len: int) -> int {
+    // CAPTURE_SOCK mode: accumulate into CaptureCtx buffer (for HTTP.sys full routing)
+    if sock == CAPTURE_SOCK {
+        let cc = tls as *CaptureCtx;
+        let avail = cc.cap - cc.len;
+        let copy  = if len < avail { len } else { avail };
+        if copy > 0 { MemCopy(cc.buf + cc.len, buf, copy); cc.len = cc.len + copy; }
+        return len;
+    }
+    if tls == 0 as *opaque { return send(sock, buf, len, 0); }
+    return TlsSend(tls as *TlsConn, buf, len);
+}
+
+func ConnRecv(sock: int, tls: *opaque, buf: *char8, cap: int) -> int {
+    if tls == 0 as *opaque { return recv(sock, buf, cap, 0); }
+    return TlsRecv(tls as *TlsConn, buf, cap);
+}
+
+// ── Server-side inbound TLS ───────────────────────────────────────────────────
+
+// Perform the SChannel server-side handshake on tls.sock.
+// srv_cred_lower / srv_cred_upper: the shared server credential handle
+// (acquired once via LoadServerCred and stored in ServerCtx).
+// On success, tls.initialized = true and TlsSend/TlsRecv are ready.
+func TlsServerAccept(tls: *TlsConn, srv_cred_lower: int, srv_cred_upper: int) -> bool {
+    // Build server credential handle buffer (16 bytes, not stored in tls to avoid
+    // TlsClose freeing the shared handle).
+    var srv_cred_buf: [char8; 16] = [0; 16];
+    WriteSecHandle(&srv_cred_buf as *char8, srv_cred_lower, srv_cred_upper);
+
+    // Receive initial client data (ClientHello)
+    var in_data: [char8; 32768] = [0; 32768];
+    var in_data_len: int = 0;
+    let nr0 = recv(tls.sock, &in_data as *char8, 32768, 0);
+    if nr0 <= 0 { return false; }
+    in_data_len = nr0;
+
+    var ctx_handle: [char8; 16] = [0; 16];
+    var ctx_attrs: uint32 = 0;
+    var first_call: bool = true;
+
+    var out_sec_buf: [char8; 16] = [0; 16];
+    var out_sec_desc: [char8; 16] = [0; 16];
+    var in_sec_bufs: [char8; 32] = [0; 32];
+    var in_sec_desc: [char8; 16] = [0; 16];
+
+    loop {
+        // Prepare output buffer
+        WriteSecBuffer(&out_sec_buf as *char8, 0, SECBUFFER_TOKEN, 0);
+        WriteSecBufDesc(&out_sec_desc as *char8, SECBUFFER_VERSION, 1,
+                        &out_sec_buf as *char8 as int);
+
+        // Prepare input buffer
+        WriteSecBuffer(&in_sec_bufs as *char8,
+                       in_data_len as uint32, SECBUFFER_TOKEN,
+                       &in_data as *char8 as int);
+        WriteSecBuffer(&in_sec_bufs as *char8 + 16, 0, SECBUFFER_EMPTY, 0);
+        WriteSecBufDesc(&in_sec_desc as *char8, SECBUFFER_VERSION, 2,
+                        &in_sec_bufs as *char8 as int);
+
+        let ctx_in_ptr: int =
+            if first_call { 0 }
+            else          { &ctx_handle as *char8 as int };
+
+        let asc_rc = AcceptSecurityContext(
+            &srv_cred_buf as *opaque,
+            ctx_in_ptr as *opaque,
+            &in_sec_desc as *opaque,
+            ASC_REQ_FLAGS,
+            SECURITY_NATIVE_DREP,
+            &ctx_handle as *opaque,
+            &out_sec_desc as *opaque,
+            &ctx_attrs,
+            0 as *opaque);
+
+        first_call = false;
+
+        // Send the output token if SSPI produced one
+        let out_pv = ReadSecBufPv(&out_sec_buf as *char8);
+        let out_cb = ReadSecBufCb(&out_sec_buf as *char8);
+        if out_pv != 0 && out_cb > 0 {
+            var sent: int = 0;
+            loop {
+                if sent >= out_cb as int { break; }
+                let s = send(tls.sock, out_pv as *char8 + sent,
+                             out_cb as int - sent, 0);
+                if s <= 0 { FreeContextBuffer(out_pv as *opaque); return false; }
+                sent = sent + s;
+            }
+            FreeContextBuffer(out_pv as *opaque);
+        }
+
+        if asc_rc == SEC_E_OK { break; }
+
+        if asc_rc != SEC_I_CONTINUE_NEEDED {
+            LogStr(c8"[tls-srv] AcceptSecurityContext failed\n".data);
+            return false;
+        }
+
+        // Check for SECBUFFER_EXTRA in input (unconsumed bytes from client)
+        var extra_ptr: int = 0;
+        var extra_cb: int  = 0;
+        var k: int = 0;
+        loop {
+            if k >= 2 { break; }
+            let sb = &in_sec_bufs as *char8 + (k * 16);
+            if ReadSecBufType(sb) == SECBUFFER_EXTRA {
+                extra_ptr = ReadSecBufPv(sb);
+                extra_cb  = ReadSecBufCb(sb) as int;
+            }
+            k = k + 1;
+        }
+
+        // Shift any extra bytes to the front, then receive more
+        MemZero(&in_data as *char8, 32768);
+        in_data_len = 0;
+        if extra_cb > 0 && extra_ptr != 0 {
+            MemCopy(&in_data as *char8, extra_ptr as *char8, extra_cb);
+            in_data_len = extra_cb;
+        }
+
+        let nr = recv(tls.sock,
+                      &in_data as *char8 + in_data_len,
+                      32768 - in_data_len, 0);
+        if nr <= 0 { return false; }
+        in_data_len = in_data_len + nr;
+    }
+
+    ReadSecHandle(&ctx_handle as *char8, &tls.ctx_lower, &tls.ctx_upper);
+
+    // Query stream sizes
+    var sizes: [char8; 20] = [0; 20];
+    let qa_rc = QueryContextAttributesA(
+        &ctx_handle as *opaque, SECPKG_ATTR_STREAM_SIZES, &sizes as *opaque);
+    if qa_rc != SEC_E_OK { return false; }
+
+    tls.hdr_size = ReadU32At(&sizes as *char8 as int, 0);
+    tls.trl_size = ReadU32At(&sizes as *char8 as int, 4);
+    tls.max_msg  = ReadU32At(&sizes as *char8 as int, 8);
+    tls.initialized = true;
+    return true;
+}
+
+// Load a PKCS#12 (.pfx) certificate and acquire a server SChannel credential.
+// cert_file  — null-terminated path to the .pfx file
+// cert_pass  — null-terminated password (ASCII; converted to wide internally)
+// out_lower / out_upper — receive the SecHandle for use in TlsServerAccept
+// Returns true on success.
+func LoadServerCred(cert_file: *char8, cert_pass: *char8,
+                    out_lower: *int, out_upper: *int) -> bool {
+    // 1. Read the .pfx file into heap memory
+    let fh = CreateFileA(cert_file, GENERIC_READ, FILE_SHARE_READ,
+                         0 as *opaque, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+    if fh == INVALID_HANDLE_VALUE {
+        LogStr(c8"[tls-srv] cert file not found\n".data);
+        return false;
+    }
+    var fs: int64 = 0;
+    GetFileSizeEx(fh, &fs);
+    if fs <= 0 || fs > 4194304 { CloseHandle(fh); return false; }
+    let heap = GetProcessHeap();
+    let pfx_data = HeapAlloc(heap, HEAP_ZERO_MEMORY, fs as uint64) as *char8;
+    if pfx_data == 0 as *char8 { CloseHandle(fh); return false; }
+    var br: uint32 = 0;
+    ReadFile(fh, pfx_data, fs as uint32, &br, 0 as *opaque);
+    CloseHandle(fh);
+
+    // 2. Build CRYPT_DATA_BLOB { DWORD cbData; BYTE* pbData; } = 16 bytes on x64
+    var pfx_blob: [char8; 16] = [0; 16];
+    let fsz: int = br as int;
+    pfx_blob[0] = (fsz & 0xFF) as char8;
+    pfx_blob[1] = ((fsz >> 8) & 0xFF) as char8;
+    pfx_blob[2] = ((fsz >> 16) & 0xFF) as char8;
+    pfx_blob[3] = ((fsz >> 24) & 0xFF) as char8;
+    var vi: int = 0;
+    var vv: int = pfx_data as int;
+    loop { if vi >= 8 { break; } pfx_blob[8 + vi] = (vv & 0xFF) as char8; vv = vv >> 8; vi = vi + 1; }
+
+    // 3. Convert password to UTF-16LE
+    let pass_len = StrLen(cert_pass);
+    var pass_w: [char8; 256] = [0; 256];
+    var pi: int = 0;
+    loop {
+        if pi >= pass_len || pi * 2 + 2 >= 256 { break; }
+        pass_w[pi * 2]     = cert_pass[pi];
+        pass_w[pi * 2 + 1] = 0 as char8;
+        pi = pi + 1;
+    }
+    pass_w[pi * 2] = 0 as char8; pass_w[pi * 2 + 1] = 0 as char8;
+
+    // 4. Import PFX into a temporary certificate store
+    let store = PFXImportCertStore(&pfx_blob as *opaque, &pass_w as *char8,
+                                   PKCS12_NO_PERSIST_KEY);
+    HeapFree(heap, 0, pfx_data as *opaque);
+    if store == 0 {
+        LogStr(c8"[tls-srv] PFXImportCertStore failed\n".data);
+        return false;
+    }
+
+    // 5. Find the first certificate
+    let cert_ctx = CertFindCertificateInStore(store, CERT_ENCODING_TYPE,
+                                               0, CERT_FIND_ANY,
+                                               0 as *opaque, 0 as *opaque);
+    if cert_ctx == 0 as *opaque {
+        CertCloseStore(store, 0);
+        LogStr(c8"[tls-srv] no certificate found in PFX\n".data);
+        return false;
+    }
+
+    // 6. Build SCHANNEL_CRED (80 bytes): dwVersion=4, cCreds=1, paCred=&cert_ctx
+    var cred_arr: [char8; 8] = [0; 8];   // one PCCERT_CONTEXT pointer
+    vi = 0; vv = cert_ctx as int;
+    loop { if vi >= 8 { break; } cred_arr[vi] = (vv & 0xFF) as char8; vv = vv >> 8; vi = vi + 1; }
+
+    var sc_cred: [char8; 80] = [0; 80];
+    sc_cred[0] = SCHANNEL_CRED_VERSION as char8;   // dwVersion = 4
+    sc_cred[4] = 1 as char8;                        // cCreds = 1
+    vi = 0; vv = &cred_arr as *char8 as int;
+    loop { if vi >= 8 { break; } sc_cred[8 + vi] = (vv & 0xFF) as char8; vv = vv >> 8; vi = vi + 1; }
+
+    // 7. Acquire inbound server credentials
+    var cred_handle: [char8; 16] = [0; 16];
+    let unisp = c8"Microsoft Unified Security Protocol Provider";
+    let acq_rc = AcquireCredentialsHandleA(
+        0 as *char8, unisp.data, SECPKG_CRED_INBOUND,
+        0 as *opaque, &sc_cred as *opaque,
+        0 as *opaque, 0 as *opaque,
+        &cred_handle as *opaque, 0 as *opaque);
+
+    CertFreeCertificateContext(cert_ctx);
+    CertCloseStore(store, 0);
+
+    if acq_rc != SEC_E_OK {
+        LogStr(c8"[tls-srv] AcquireCredentialsHandle failed\n".data);
+        return false;
+    }
+
+    ReadSecHandle(&cred_handle as *char8, out_lower, out_upper);
+    return true;
+}
+
+// ── TLS Proxy (legacy — superseded by ProxyRequest in Proxy.rux) ─────────────
+
+// Forward declarations
+func ReconstructRequest(req: *Request, out: *char8, out_cap: int,
+                        strip_prefix_len: int, want_ka: bool, ws_upgrade: bool) -> int;
+func SendText(sock: int, tls: *opaque, status: *char8, status_len: int,
+              body: *char8, body_len: int, keep_alive: bool);
+func ConnectToUpstream(up: *UpstreamDef) -> int;
+
+// Forwards req over TLS to an upstream UpstreamDef, relays response to client_sock.
+// client_tls: 0 for plain client connection, or *TlsConn for inbound TLS.
+func TlsProxyRequest(client_sock: int, req: *Request,
+                     up: *UpstreamDef, client_tls: *opaque) {
+    let up_sock = ConnectToUpstream(up);
+    if up_sock == INVALID_SOCKET {
+        SendText(client_sock, client_tls,
+                 c8"502 Bad Gateway".data, 15,
+                 c8"upstream unavailable\n".data, 21,
+                 false);
+        return;
+    }
+
+    var tls: TlsConn = EmptyTlsConn(up_sock);
+    var host_buf: [char8; 65] = [0; 65];
+    MemCopy(&host_buf as *char8, &up.host as *char8, up.host_len);
+    host_buf[up.host_len] = 0 as char8;
+
+    if !TlsConnect(&tls, &host_buf as *char8) {
+        TlsClose(&tls);
+        closesocket(up_sock);
+        SendText(client_sock, client_tls,
+                 c8"502 Bad Gateway".data, 15,
+                 c8"TLS handshake failed\n".data, 21,
+                 false);
+        return;
+    }
+
+    var fwd: [char8; 32768] = [0; 32768];
+    let fwd_len = ReconstructRequest(req, &fwd as *char8, 32768, 0, false, false);
+    let sent = TlsSend(&tls, &fwd as *char8, fwd_len);
+
+    if sent < fwd_len {
+        TlsClose(&tls);
+        closesocket(up_sock);
+        SendText(client_sock, client_tls,
+                 c8"502 Bad Gateway".data, 15,
+                 c8"upstream send failed\n".data, 21,
+                 false);
+        return;
+    }
+
+    var relay: [char8; 8192] = [0; 8192];
+    loop {
+        let n = TlsRecv(&tls, &relay as *char8, 8192);
+        if n <= 0 { break; }
+        var w: int = 0;
+        loop {
+            if w >= n { break; }
+            let s = ConnSend(client_sock, client_tls, &relay as *char8 + w, n - w);
+            if s <= 0 { break; }
+            w = w + s;
+        }
+    }
+
+    TlsClose(&tls);
+    closesocket(up_sock);
+}

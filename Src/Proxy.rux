@@ -1,0 +1,505 @@
+// Warpgate — Reverse proxy
+//
+// Phase 7 additions:
+//   - Upstream keep-alive detection: scans response for Content-Length /
+//     Connection headers; returns pooled socket to pool when reuse is safe.
+//   - Chunked response passthrough: forward chunked responses to client and
+//     detect the 0-chunk terminator so we know when the body ends.
+//   - WebSocket upgrade passthrough: bidirectional relay via select().
+//   - client_tls: *opaque — 0 for plain inbound, *TlsConn for inbound TLS.
+
+// Forward declarations
+func ConnSend(sock: int, tls: *opaque, buf: *char8, len: int) -> int;
+func SendText(sock: int, tls: *opaque, status: *char8, status_len: int,
+              body: *char8, body_len: int, keep_alive: bool);
+func TryInsertConn(pool: *ConnPool, sock: int, up_idx: int) -> bool;
+func ConnRecv(sock: int, tls: *opaque, buf: *char8, cap: int) -> int;
+func TlsConnect(tls: *TlsConn, hostname: *char8) -> bool;
+func TlsSend(tls: *TlsConn, data: *char8, len: int) -> int;
+func TlsRecv(tls: *TlsConn, dst: *char8, cap: int) -> int;
+func TlsClose(tls: *TlsConn);
+func EmptyTlsConn(sock: int) -> TlsConn;
+
+// Opens an ephemeral (non-pooled) connection to a specific UpstreamDef.
+func OpenUpstream(up: *UpstreamDef) -> int {
+    return ConnectToUpstream(up);
+}
+
+// ── fd_set helpers for select()-based WebSocket relay ─────────────────────────
+// fd_set on Win64: [fd_count u32][pad 4][fd_array: 64 × int (8 bytes)]
+
+func FdZero(fds: *char8) { MemZero(fds, FD_SET_BYTES); }
+
+func FdSet(fds: *char8, sock: int) {
+    let count = ReadU32At(fds as int, 0) as int;
+    if count >= 64 { return; }
+    var vi: int = 0;
+    var vv: int = sock;
+    loop {
+        if vi >= 8 { break; }
+        fds[8 + count * 8 + vi] = (vv & 0xFF) as char8;
+        vv = vv >> 8;
+        vi = vi + 1;
+    }
+    // increment count
+    let new_count = (count + 1) as uint32;
+    fds[0] = (new_count & 0xFF) as char8;
+    fds[1] = ((new_count >> 8) & 0xFF) as char8;
+    fds[2] = 0 as char8;
+    fds[3] = 0 as char8;
+}
+
+func FdIsSet(fds: *char8, sock: int) -> bool {
+    let count = ReadU32At(fds as int, 0) as int;
+    var i: int = 0;
+    loop {
+        if i >= count { break; }
+        let s = ReadPtrAt(fds as int, 8 + i * 8);
+        if s == sock { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// ── WebSocket detection ───────────────────────────────────────────────────────
+
+// Returns true if the request is an HTTP Upgrade to WebSocket.
+func IsWebSocketUpgrade(req: *Request) -> bool {
+    if req.method != Method.GET { return false; }
+    let upg = GetHeader(req, c8"Upgrade".data, 7);
+    if upg == 0 as *char8 { return false; }
+    if !MemEqCI(upg, c8"websocket".data, 9) { return false; }
+    let conn = GetHeader(req, c8"Connection".data, 10);
+    if conn == 0 as *char8 { return false; }
+    // Connection header may be "keep-alive, Upgrade" etc.
+    let clen = StrLen(conn);
+    var i: int = 0;
+    loop {
+        if i + 6 > clen { break; }
+        if MemEqCI(conn + i, c8"Upgrade".data, 7) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// ── WebSocket bidirectional relay ─────────────────────────────────────────────
+//
+// After a 101 Switching Protocols response, relay data in both directions
+// using select() until either side closes the connection.
+
+// ── WebSocket bidirectional relay (two-thread, TLS-safe) ─────────────────────
+//
+// Each direction gets its own thread so blocking recv on one side never stalls
+// the other.  Works correctly with TLS on either or both legs (no FIONBIO needed).
+
+struct WsRelayCtx {
+    src_sock:  int,
+    dst_sock:  int,
+    src_tls:   *opaque,
+    dst_tls:   *opaque,
+    done:      *int,   // shared flag: 1 = one side closed; stop both
+}
+
+@[Export]
+func WsRelayThread(param: *opaque) -> uint32 {
+    let rc = param as *WsRelayCtx;
+    var buf: [char8; 8192] = [0; 8192];
+    loop {
+        if rc.done[0] != 0 { break; }
+        let n = ConnRecv(rc.src_sock, rc.src_tls, &buf as *char8, 8192);
+        if n <= 0 { break; }
+        var w: int = 0;
+        loop {
+            if w >= n { break; }
+            let s = ConnSend(rc.dst_sock, rc.dst_tls, &buf as *char8 + w, n - w);
+            if s <= 0 { rc.done[0] = 1; break; }
+            w = w + s;
+        }
+        if w < n { break; }
+    }
+    rc.done[0] = 1;
+    return 0;
+}
+
+// up_tls: 0 for plain upstream, or *TlsConn for TLS upstream.
+func WebSocketRelay(client_sock: int, up_sock: int,
+                    client_tls: *opaque, up_tls: *opaque) {
+    let heap = GetProcessHeap();
+
+    // Shared done flag (int = 8 bytes on Win64)
+    let done = HeapAlloc(heap, HEAP_ZERO_MEMORY, 8 as uint64) as *int;
+    done[0] = 0;
+
+    // client→upstream context (spawned thread)
+    let rc1 = HeapAlloc(heap, HEAP_ZERO_MEMORY, 48 as uint64) as *WsRelayCtx;
+    rc1.src_sock = client_sock; rc1.src_tls = client_tls;
+    rc1.dst_sock = up_sock;     rc1.dst_tls = up_tls;
+    rc1.done     = done;
+
+    // upstream→client context (this thread)
+    let rc2 = HeapAlloc(heap, HEAP_ZERO_MEMORY, 48 as uint64) as *WsRelayCtx;
+    rc2.src_sock = up_sock;     rc2.src_tls = up_tls;
+    rc2.dst_sock = client_sock; rc2.dst_tls = client_tls;
+    rc2.done     = done;
+
+    var tid: uint32 = 0;
+    let th = CreateThread(0 as *opaque, 0, WsRelayThread as *opaque,
+                          rc1 as *opaque, 0, &tid);
+
+    // Run upstream→client in the current thread
+    WsRelayThread(rc2 as *opaque);
+
+    // Signal done and wait for the other direction to finish (max 30 s)
+    done[0] = 1;
+    if th != 0 {
+        WaitForSingleObject(th, 30000);
+        CloseHandle(th);
+    }
+
+    HeapFree(heap, 0, done as *opaque);
+    HeapFree(heap, 0, rc1 as *opaque);
+    HeapFree(heap, 0, rc2 as *opaque);
+}
+
+// ── Upstream relay with keep-alive detection ──────────────────────────────────
+//
+// Relays req to up_sock, streams response back to client_sock.
+// Sets *up_ka to true if the upstream connection can safely be reused.
+// want_ka: whether we sent Connection: keep-alive to upstream.
+// Returns true if the relay completed without I/O error.
+
+func RelayToUpstream(client_sock: int, up_sock: int, req: *Request,
+                     strip_len: int, want_ka: bool, client_tls: *opaque,
+                     up_ka: *bool) -> bool {
+    up_ka[0] = false;
+
+    // Send reconstructed request to upstream
+    var fwd: [char8; 32768] = [0; 32768];
+    let fwd_len = ReconstructRequest(req, &fwd as *char8, 32768, strip_len,
+                                     want_ka, false);
+    var sent: int = 0;
+    loop {
+        if sent >= fwd_len { break; }
+        let n = send(up_sock, &fwd as *char8 + sent, fwd_len - sent, 0);
+        if n <= 0 { return false; }
+        sent = sent + n;
+    }
+
+    // Read upstream response into a buffer to parse headers
+    var resp: [char8; 32768] = [0; 32768];
+    var resp_len: int = 0;
+
+    // Keep reading until we see the blank line (end of headers)
+    loop {
+        if resp_len >= 32767 { break; }
+        let n = recv(up_sock, &resp as *char8 + resp_len, 32767 - resp_len, 0);
+        if n <= 0 { break; }
+        resp_len = resp_len + n;
+        // Check for \r\n\r\n end-of-headers marker
+        var j: int = 0;
+        loop {
+            if j + 3 >= resp_len { break; }
+            if resp[j] == c8'\r'[0] && resp[j+1] == c8'\n'[0] &&
+               resp[j+2] == c8'\r'[0] && resp[j+3] == c8'\n'[0] {
+                break;
+            }
+            j = j + 1;
+        }
+        if j + 3 < resp_len { break; }
+    }
+
+    if resp_len == 0 { return false; }
+
+    // Parse upstream response headers
+    var content_length: int = -1;
+    var is_chunked: bool    = false;
+    var up_keepalive: bool  = false;
+    let body_start = ParseUpstreamResponse(&resp as *char8, resp_len,
+                                            &content_length, &is_chunked,
+                                            &up_keepalive);
+
+    // Forward what we've buffered so far
+    var w: int = 0;
+    loop {
+        if w >= resp_len { break; }
+        let n = ConnSend(client_sock, client_tls, &resp as *char8 + w, resp_len - w);
+        if n <= 0 { return false; }
+        w = w + n;
+    }
+
+    // Determine relay mode and forward remaining body
+    if content_length >= 0 && body_start >= 0 {
+        // Known body length: read exactly the remaining bytes
+        let already_got = resp_len - body_start;
+        var remaining: int = content_length - already_got;
+        var relay: [char8; 8192] = [0; 8192];
+        loop {
+            if remaining <= 0 { break; }
+            var to_read: int = if remaining < 8192 { remaining } else { 8192 };
+            let n = recv(up_sock, &relay as *char8, to_read, 0);
+            if n <= 0 { break; }
+            var w2: int = 0;
+            loop {
+                if w2 >= n { break; }
+                let s = ConnSend(client_sock, client_tls, &relay as *char8 + w2, n - w2);
+                if s <= 0 { return false; }
+                w2 = w2 + s;
+            }
+            remaining = remaining - n;
+        }
+        // Connection can be reused only if upstream says keep-alive AND we asked for it
+        up_ka[0] = want_ka && up_keepalive;
+    } else if is_chunked {
+        // Chunked: relay until we see the 0-chunk terminator ("0\r\n\r\n")
+        var relay: [char8; 8192] = [0; 8192];
+        loop {
+            let n = recv(up_sock, &relay as *char8, 8192, 0);
+            if n <= 0 { break; }
+            var w2: int = 0;
+            loop {
+                if w2 >= n { break; }
+                let s = ConnSend(client_sock, client_tls, &relay as *char8 + w2, n - w2);
+                if s <= 0 { return false; }
+                w2 = w2 + s;
+            }
+            // Check for "0\r\n\r\n" (5 bytes) near the end — simple heuristic
+            if n >= 5 {
+                var k: int = n - 5;
+                loop {
+                    if k < 0 { break; }
+                    if relay[k]   == c8'0'[0]  && relay[k+1] == c8'\r'[0] &&
+                       relay[k+2] == c8'\n'[0] && relay[k+3] == c8'\r'[0] &&
+                       relay[k+4] == c8'\n'[0] {
+                        up_ka[0] = want_ka && up_keepalive;
+                        break;
+                    }
+                    k = k - 1;
+                }
+                if up_ka[0] { break; }
+            }
+        }
+    } else {
+        // Unknown length: relay until upstream closes
+        var relay: [char8; 8192] = [0; 8192];
+        loop {
+            let n = recv(up_sock, &relay as *char8, 8192, 0);
+            if n <= 0 { break; }
+            var w2: int = 0;
+            loop {
+                if w2 >= n { break; }
+                let s = ConnSend(client_sock, client_tls, &relay as *char8 + w2, n - w2);
+                if s <= 0 { return false; }
+                w2 = w2 + s;
+            }
+        }
+    }
+
+    return true;
+}
+
+// ── ProxyRequest ──────────────────────────────────────────────────────────────
+
+func ProxyRequest(client_sock: int, req: *Request, ctx: *ServerCtx,
+                  client_tls: *opaque) {
+    let cfg = &ctx.config as *Config;
+
+    let strip_len =
+        if cfg.proxy_strip && cfg.proxy_prefix_len > 1 {
+            cfg.proxy_prefix_len
+        } else { 0 };
+
+    // ── WebSocket upgrade passthrough ─────────────────────────────────────────
+    if IsWebSocketUpgrade(req) {
+        let up_idx = SelectUpstream(&ctx.up_pool);
+        if up_idx < 0 {
+            req.status_code = 502;
+            SendText(client_sock, client_tls, c8"502 Bad Gateway".data, 15,
+                     c8"no healthy upstream\n".data, 20, false);
+            return;
+        }
+        let up: *UpstreamDef = &ctx.up_pool.upstreams[up_idx] as *UpstreamDef;
+        let up_sock = OpenUpstream(up);
+        if up_sock == INVALID_SOCKET {
+            ReleaseUpstream(&ctx.up_pool, up_idx, false);
+            req.status_code = 502;
+            SendText(client_sock, client_tls, c8"502 Bad Gateway".data, 15,
+                     c8"upstream unavailable\n".data, 21, false);
+            return;
+        }
+
+        // Optional TLS handshake to upstream
+        var ws_up_tls_state: TlsConn = EmptyTlsConn(up_sock);
+        var ws_up_tls: *opaque = 0 as *opaque;
+        if up.tls {
+            var ws_host: [char8; 65] = [0; 65];
+            MemCopy(&ws_host as *char8, &up.host as *char8, up.host_len);
+            ws_host[up.host_len] = 0 as char8;
+            if TlsConnect(&ws_up_tls_state, &ws_host as *char8) {
+                ws_up_tls = &ws_up_tls_state as *opaque;
+            } else {
+                TlsClose(&ws_up_tls_state); closesocket(up_sock);
+                ReleaseUpstream(&ctx.up_pool, up_idx, false);
+                req.status_code = 502;
+                SendText(client_sock, client_tls, c8"502 Bad Gateway".data, 15,
+                         c8"TLS handshake to upstream failed\n".data, 33, false);
+                return;
+            }
+        }
+
+        // Forward WebSocket upgrade request (preserve Upgrade/Connection headers)
+        var fwd: [char8; 32768] = [0; 32768];
+        let fwd_len = ReconstructRequest(req, &fwd as *char8, 32768, strip_len,
+                                         false, true);
+        var sent: int = 0;
+        loop {
+            if sent >= fwd_len { break; }
+            let n = ConnSend(up_sock, ws_up_tls, &fwd as *char8 + sent, fwd_len - sent);
+            if n <= 0 { break; }
+            sent = sent + n;
+        }
+
+        // Receive upstream's 101 response and forward to client
+        var hand: [char8; 4096] = [0; 4096];
+        let hn = ConnRecv(up_sock, ws_up_tls, &hand as *char8, 4096);
+        if hn > 0 {
+            ConnSend(client_sock, client_tls, &hand as *char8, hn);
+        }
+
+        // Bidirectional relay until either side closes
+        WebSocketRelay(client_sock, up_sock, client_tls, ws_up_tls);
+
+        if up.tls { TlsClose(&ws_up_tls_state); }
+        closesocket(up_sock);
+        ReleaseUpstream(&ctx.up_pool, up_idx, true);
+        req.status_code = 101;
+        return;
+    }
+
+    // ── TLS upstream path ─────────────────────────────────────────────────────
+    if cfg_up_pool_has_tls(ctx) {
+        var tls_idx: int = FindTlsUpstream(&ctx.up_pool);
+        if tls_idx >= 0 {
+            let up: *UpstreamDef = &ctx.up_pool.upstreams[tls_idx] as *UpstreamDef;
+            let up_sock = OpenUpstream(up);
+            if up_sock == INVALID_SOCKET {
+                ReleaseUpstream(&ctx.up_pool, tls_idx, false);
+                req.status_code = 502;
+                SendText(client_sock, client_tls, c8"502 Bad Gateway".data, 15,
+                         c8"upstream unavailable\n".data, 21, false);
+                return;
+            }
+            var tls: TlsConn = EmptyTlsConn(up_sock);
+            var hbuf: [char8; 65] = [0; 65];
+            MemCopy(&hbuf as *char8, &up.host as *char8, up.host_len);
+            hbuf[up.host_len] = 0 as char8;
+            if !TlsConnect(&tls, &hbuf as *char8) {
+                TlsClose(&tls); closesocket(up_sock);
+                ReleaseUpstream(&ctx.up_pool, tls_idx, false);
+                req.status_code = 502;
+                SendText(client_sock, client_tls, c8"502 Bad Gateway".data, 15,
+                         c8"TLS handshake failed\n".data, 21, false);
+                return;
+            }
+            var fwd: [char8; 32768] = [0; 32768];
+            let fwd_len = ReconstructRequest(req, &fwd as *char8, 32768, strip_len,
+                                             false, false);
+            TlsSend(&tls, &fwd as *char8, fwd_len);
+            var relay: [char8; 8192] = [0; 8192];
+            loop {
+                let n = TlsRecv(&tls, &relay as *char8, 8192);
+                if n <= 0 { break; }
+                var wt: int = 0;
+                loop {
+                    if wt >= n { break; }
+                    let s = ConnSend(client_sock, client_tls,
+                                     &relay as *char8 + wt, n - wt);
+                    if s <= 0 { break; }
+                    wt = wt + s;
+                }
+            }
+            TlsClose(&tls); closesocket(up_sock);
+            ReleaseUpstream(&ctx.up_pool, tls_idx, true);
+            req.status_code = 200;
+            return;
+        }
+    }
+
+    // ── Plain-text path (connection pool + load balancing) ────────────────────
+    let up_idx = SelectUpstream(&ctx.up_pool);
+    if up_idx < 0 {
+        req.status_code = 502;
+        SendText(client_sock, client_tls, c8"502 Bad Gateway".data, 15,
+                 c8"no healthy upstream\n".data, 20, false);
+        return;
+    }
+
+    let up: *UpstreamDef = &ctx.up_pool.upstreams[up_idx] as *UpstreamDef;
+
+    var up_sock: int = AcquireConn(&ctx.conn_pool, up_idx, up);
+    var pooled: bool = up_sock != INVALID_SOCKET;
+    if !pooled { up_sock = OpenUpstream(up); }
+
+    if up_sock == INVALID_SOCKET {
+        ReleaseUpstream(&ctx.up_pool, up_idx, false);
+        req.status_code = 502;
+        SendText(client_sock, client_tls, c8"502 Bad Gateway".data, 15,
+                 c8"upstream unavailable\n".data, 21, false);
+        return;
+    }
+
+    // Request upstream keep-alive when using the connection pool
+    var up_ka: bool = false;
+    let ok = RelayToUpstream(client_sock, up_sock, req, strip_len,
+                              pooled, client_tls, &up_ka);
+
+    if pooled {
+        // Return to pool only if io succeeded and upstream wants keep-alive
+        ReleaseConn(&ctx.conn_pool, up_sock, ok && up_ka);
+    } else {
+        // Ephemeral connection: try to donate to pool if upstream is keep-alive
+        if ok && up_ka && !TryInsertConn(&ctx.conn_pool, up_sock, up_idx) {
+            closesocket(up_sock);
+        }
+        if !(ok && up_ka) { closesocket(up_sock); }
+    }
+
+    ReleaseUpstream(&ctx.up_pool, up_idx, ok);
+    req.status_code = if ok { 200 } else { 502 };
+    if !ok {
+        SendText(client_sock, client_tls, c8"502 Bad Gateway".data, 15,
+                 c8"upstream error\n".data, 15, false);
+    }
+}
+
+// Returns true if any upstream in the pool has TLS enabled.
+func cfg_up_pool_has_tls(ctx: *ServerCtx) -> bool {
+    var i: int = 0;
+    loop {
+        if i >= ctx.up_pool.count { break; }
+        if ctx.up_pool.upstreams[i].tls { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Returns index of first healthy TLS upstream, or -1.
+func FindTlsUpstream(pool: *UpstreamPool) -> int {
+    EnterCriticalSection(&pool.lock as *opaque);
+    var result: int = -1;
+    var i: int = 0;
+    loop {
+        if i >= pool.count { break; }
+        let up: *UpstreamDef = &pool.upstreams[i] as *UpstreamDef;
+        if up.tls && up.healthy { result = i; break; }
+        i = i + 1;
+    }
+    LeaveCriticalSection(&pool.lock as *opaque);
+    return result;
+}
+
+func PathMatchesProxy(req: *Request, cfg: *Config) -> bool {
+    let plen = cfg.proxy_prefix_len;
+    if plen == 0 { return false; }
+    if req.path_len < plen { return false; }
+    return MemEq(&req.path as *char8, &cfg.proxy_prefix as *char8, plen);
+}

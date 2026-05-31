@@ -1,0 +1,178 @@
+// Warpgate — gzip compression via zlib1.dll
+
+func ConnSend(sock: int, tls: *opaque, buf: *char8, len: int) -> int;
+func SendText(sock: int, tls: *opaque, status: *char8, status_len: int,
+              body: *char8, body_len: int, keep_alive: bool);
+//
+// z_stream layout on Win64 (MSVC — uLong = 4 bytes):
+//   0  next_in   (ptr, 8)
+//   8  avail_in  (uint32, 4)
+//  12  total_in  (uint32, 4)   [uLong = 4 on MSVC]
+//  16  next_out  (ptr, 8)
+//  24  avail_out (uint32, 4)
+//  28  total_out (uint32, 4)
+//  32  msg       (ptr, 8)
+//  40  state     (ptr, 8)
+//  48  zalloc    (ptr, 8)
+//  56  zfree     (ptr, 8)
+//  64  opaque    (ptr, 8)
+//  72  data_type (int, 4)
+//  76  adler     (uint32, 4)
+//  80  reserved  (uint32, 4)
+//  Total ≈ 84, padded to 88.  We use Z_STREAM_SIZE = 128 for safety.
+
+// Writes a pointer value into a z_stream buffer at the given byte offset.
+func ZStreamWritePtr(strm: *char8, offset: int, ptr: int) {
+    var i: int = 0;
+    var v: int = ptr;
+    loop {
+        if i >= 8 { break; }
+        strm[offset + i] = (v & 0xFF) as char8;
+        v = v >> 8;
+        i = i + 1;
+    }
+}
+
+// Writes a uint32 into a z_stream buffer at the given byte offset.
+func ZStreamWriteU32(strm: *char8, offset: int, val: uint32) {
+    strm[offset]     = (val & 0xFF) as char8;
+    strm[offset + 1] = ((val >> 8) & 0xFF) as char8;
+    strm[offset + 2] = ((val >> 16) & 0xFF) as char8;
+    strm[offset + 3] = ((val >> 24) & 0xFF) as char8;
+}
+
+func ZStreamReadU32(strm: *char8, offset: int) -> uint32 {
+    return ReadU32At(strm as int, offset);
+}
+
+// ── GzipCompress ─────────────────────────────────────────────────────────────
+//
+// Compresses src[0..src_len) as gzip into dst[0..dst_cap).
+// Returns the compressed byte count, or -1 on error.
+// dst_cap should be at least src_len + 64 to handle incompressible data.
+
+func GzipCompress(src: *char8, src_len: int,
+                  dst: *char8, dst_cap: int) -> int {
+    var strm: [char8; 128] = [0; 128];
+
+    // deflateInit2_(strm, level, Z_DEFLATED, windowBits=31 for gzip,
+    //               memLevel=8, Z_DEFAULT_STRATEGY, version, stream_size)
+    let rc = deflateInit2_(&strm as *opaque,
+                           Z_DEFAULT_COMPRESSION, Z_DEFLATED,
+                           Z_GZIP_WINDOW_BITS, Z_MEM_LEVEL_DEFAULT,
+                           Z_DEFAULT_STRATEGY,
+                           ZLIB_VERSION, Z_STREAM_SIZE);
+    if rc != Z_OK { return -1; }
+
+    // next_in = src, avail_in = src_len
+    ZStreamWritePtr(&strm as *char8, 0, src as int);
+    ZStreamWriteU32(&strm as *char8, 8, src_len as uint32);
+
+    // next_out = dst, avail_out = dst_cap
+    ZStreamWritePtr(&strm as *char8, 16, dst as int);
+    ZStreamWriteU32(&strm as *char8, 24, dst_cap as uint32);
+
+    let ret = deflate(&strm as *opaque, Z_FINISH);
+    deflateEnd(&strm as *opaque);
+
+    if ret != Z_STREAM_END { return -1; }
+
+    // Compressed size = dst_cap - avail_out
+    let avail_out = ZStreamReadU32(&strm as *char8, 24) as int;
+    return dst_cap - avail_out;
+}
+
+// ── GzipDecompress ────────────────────────────────────────────────────────────
+//
+// Decompresses gzip src into dst. Returns decompressed byte count, or -1.
+
+func GzipDecompress(src: *char8, src_len: int,
+                    dst: *char8, dst_cap: int) -> int {
+    var strm: [char8; 128] = [0; 128];
+
+    // inflateInit2 with windowBits=47 (32+15) to auto-detect gzip/zlib
+    // inflateInit_ is the v1 function; for gzip use inflateInit2_ if available.
+    // For simplicity use inflateInit_ (handles zlib-wrapped deflate):
+    let rc = inflateInit_(&strm as *opaque, ZLIB_VERSION, Z_STREAM_SIZE);
+    if rc != Z_OK { return -1; }
+
+    ZStreamWritePtr(&strm as *char8, 0, src as int);
+    ZStreamWriteU32(&strm as *char8, 8, src_len as uint32);
+    ZStreamWritePtr(&strm as *char8, 16, dst as int);
+    ZStreamWriteU32(&strm as *char8, 24, dst_cap as uint32);
+
+    let ret = inflate(&strm as *opaque, Z_FINISH);
+    inflateEnd(&strm as *opaque);
+
+    if ret != Z_STREAM_END && ret != Z_OK { return -1; }
+
+    let avail_out = ZStreamReadU32(&strm as *char8, 24) as int;
+    return dst_cap - avail_out;
+}
+
+// ── Accept-Encoding check ─────────────────────────────────────────────────────
+
+// Returns true if the client accepts gzip encoding.
+func ClientAcceptsGzip(req: *Request) -> bool {
+    let ae = GetHeader(req, c8"Accept-Encoding".data, 15);
+    if ae == 0 as *char8 { return false; }
+    let ae_len = StrLen(ae);
+    var i: int = 0;
+    loop {
+        if i + 3 > ae_len { break; }
+        if MemEqCI(ae + i, c8"gzip".data, 4) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// ── Gzip response sender ──────────────────────────────────────────────────────
+
+// Sends a gzip-compressed response if the client supports it and compression
+// helps; falls back to uncompressed.  Threshold: only compress if body > 512 bytes.
+// tls: 0 as *opaque for plain TCP, or *TlsConn cast for inbound TLS.
+func SendGzip(sock: int, tls: *opaque,
+              status: *char8, status_len: int,
+              content_type: *char8, ct_len: int,
+              body: *char8, body_len: int,
+              keep_alive: bool, req: *Request) {
+    if body_len > 512 && ClientAcceptsGzip(req) {
+        // Compress with ~10% headroom + 64 bytes for gzip header/footer.
+        let dst_cap = body_len + body_len / 10 + 64;
+        let heap = GetProcessHeap();
+        let dst = HeapAlloc(heap, HEAP_ZERO_MEMORY, dst_cap as uint64) as *char8;
+        if dst != 0 as *char8 {
+            let compressed_len = GzipCompress(body, body_len, dst, dst_cap);
+            if compressed_len > 0 && compressed_len < body_len {
+                // Build response with Content-Encoding: gzip header.
+                var out: [char8; 512] = [0; 512];
+                var p: int = 0;
+                MemCopy(&out as *char8 + p, c8"HTTP/1.1 ".data, 9); p = p + 9;
+                MemCopy(&out as *char8 + p, status, status_len);      p = p + status_len;
+                MemCopy(&out as *char8 + p, c8"\r\n".data, 2);       p = p + 2;
+                MemCopy(&out as *char8 + p, c8"Content-Type: ".data, 14); p = p + 14;
+                MemCopy(&out as *char8 + p, content_type, ct_len);   p = p + ct_len;
+                MemCopy(&out as *char8 + p, c8"\r\n".data, 2);       p = p + 2;
+                MemCopy(&out as *char8 + p, c8"Content-Encoding: gzip\r\n".data, 24); p = p + 24;
+                MemCopy(&out as *char8 + p, c8"Content-Length: ".data, 16); p = p + 16;
+                var cl: [char8; 20] = [0; 20];
+                let cl_len = Itoa(&cl as *char8, compressed_len);
+                MemCopy(&out as *char8 + p, &cl as *char8, cl_len); p = p + cl_len;
+                MemCopy(&out as *char8 + p, c8"\r\n".data, 2); p = p + 2;
+                if keep_alive {
+                    MemCopy(&out as *char8 + p, c8"Connection: keep-alive\r\n".data, 24); p = p + 24;
+                } else {
+                    MemCopy(&out as *char8 + p, c8"Connection: close\r\n".data, 19); p = p + 19;
+                }
+                MemCopy(&out as *char8 + p, c8"\r\n".data, 2); p = p + 2;
+                ConnSend(sock, tls, &out as *char8, p);
+                ConnSend(sock, tls, dst, compressed_len);
+                HeapFree(heap, 0, dst as *opaque);
+                return;
+            }
+            HeapFree(heap, 0, dst as *opaque);
+        }
+    }
+    // Fall back to uncompressed.
+    SendText(sock, tls, status, status_len, body, body_len, keep_alive);
+}

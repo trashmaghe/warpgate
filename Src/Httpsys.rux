@@ -1,0 +1,422 @@
+// Warpgate — HTTP.sys kernel-mode HTTP server
+//
+// HTTP.sys (httpapi.dll) parses HTTP at kernel level, manages connections,
+// and queues pre-parsed requests.  Benefits: SSL offload, connection
+// management, kernel cache, no raw socket management.
+//
+// Requires: admin privileges OR a URL ACL grant for the listen URL.
+// Grant example:  netsh http add urlacl url=http://+:8080/ user=Everyone
+//
+// ── struct layout notes ───────────────────────────────────────────────────────
+//
+// HTTP_REQUEST_V1 field offsets (Win64) — accessed via ReadPtrAt / ReadU32At:
+//   16  RequestId       (ULONGLONG, 8) — pass to HttpSendHttpResponse
+//   36  Verb            (HTTP_VERB enum, int 4)
+//   42  RawUrlLength    (USHORT, 2)
+//   56  pRawUrl         (PCSTR, 8)   — null-terminated ASCII URL path
+//   68  AbsPathLength   (USHORT in CookedUrl, 2) — UTF-16 length in bytes
+//   88  pAbsPath        (PCWSTR, 8)  — UTF-16 absolute path (use RawUrl instead)
+//  104  pRemoteAddress  (PSOCKADDR, 8) — for client IP
+//
+// HTTP_RESPONSE_V1 layout — we write directly at byte offsets:
+//    8  StatusCode      (USHORT)
+//   10  ReasonLength    (USHORT)
+//   16  pReason         (PCSTR)
+//   24  Headers start   (HTTP_RESPONSE_HEADERS)
+//  536  EntityChunkCount (USHORT)
+//  544  pEntityChunks   (PHTTP_DATA_CHUNK)
+//  Total: HTTPRESP_SIZE (560) bytes
+//
+// HTTP_DATA_CHUNK (FromMemory):
+//    0  DataChunkType   (int, 4) — 0 = HttpDataChunkFromMemory
+//    8  pBuffer         (PVOID, 8)
+//   16  BufferLength    (ULONG, 4)
+//  Total: HTTPCHUNK_SIZE (24) bytes
+//
+// Known response header slot: KnownHeaders array at offset 56 within
+// HTTP_RESPONSE_HEADERS (which starts at HTTPRESP_OFF_HEADERS = 24).
+// Each HTTP_KNOWN_HEADER = { USHORT len, 6-pad, PCSTR ptr } = 16 bytes.
+// ContentType index = 12, ContentLength index = 11.
+
+// ── Wide-string helpers ───────────────────────────────────────────────────────
+
+// Converts ASCII src[0..len) to UTF-16LE in dst[0..dst_cap).
+// Returns byte count written (not including null terminator pair).
+func ToWide(src: *char8, src_len: int, dst: *char8, dst_cap: int) -> int {
+    var i: int = 0;
+    loop {
+        if i >= src_len { break; }
+        if i * 2 + 2 >= dst_cap { break; }
+        dst[i * 2]     = src[i];
+        dst[i * 2 + 1] = 0 as char8;
+        i = i + 1;
+    }
+    dst[i * 2]     = 0 as char8;
+    dst[i * 2 + 1] = 0 as char8;
+    return i * 2;
+}
+
+// ── HTTP_RESPONSE builder ─────────────────────────────────────────────────────
+
+func WriteU16At(buf: *char8, offset: int, val: uint16) {
+    buf[offset]     = (val & 0xFF) as char8;
+    buf[offset + 1] = ((val >> 8) & 0xFF) as char8;
+}
+
+func WritePtrAt(buf: *char8, offset: int, val: int) {
+    var i: int = 0;
+    var v: int = val;
+    loop {
+        if i >= 8 { break; }
+        buf[offset + i] = (v & 0xFF) as char8;
+        v = v >> 8;
+        i = i + 1;
+    }
+}
+
+func WriteU32AtOff(buf: *char8, offset: int, val: uint32) {
+    buf[offset]     = (val & 0xFF) as char8;
+    buf[offset + 1] = ((val >> 8) & 0xFF) as char8;
+    buf[offset + 2] = ((val >> 16) & 0xFF) as char8;
+    buf[offset + 3] = ((val >> 24) & 0xFF) as char8;
+}
+
+// Sets a known response header (e.g. Content-Type, Content-Length).
+// hdr_idx: HTTP_KNOWN_HEADER index (11=Content-Length, 12=Content-Type).
+func SetKnownResponseHeader(resp_buf: *char8, hdr_idx: int,
+                             value: *char8, value_len: int) {
+    let base = HTTPRESP_OFF_HEADERS + 56 + hdr_idx * HTTP_KNOWN_HDR_STRIDE;
+    WriteU16At(resp_buf, base, value_len as uint16);
+    WritePtrAt(resp_buf, base + 8, value as int);
+}
+
+// Builds a complete HTTP_RESPONSE + HTTP_DATA_CHUNK into stack buffers,
+// then sends via HttpSendHttpResponse.
+func HttpSysSend(req_queue: int, request_id: int,
+                 status: uint16, reason: *char8, reason_len: int,
+                 content_type: *char8, ct_len: int,
+                 body: *char8, body_len: int) {
+    // HTTP_RESPONSE_V1 (zero-initialized)
+    var resp: [char8; 560] = [0; 560];
+
+    WriteU16At(&resp as *char8, HTTPRESP_OFF_STATUS_CODE, status);
+    WriteU16At(&resp as *char8, HTTPRESP_OFF_REASON_LEN, reason_len as uint16);
+    WritePtrAt(&resp as *char8, HTTPRESP_OFF_P_REASON, reason as int);
+
+    SetKnownResponseHeader(&resp as *char8, HTTP_KNOWN_HDR_CONTENT_TYPE,
+                            content_type, ct_len);
+
+    // Build Content-Length value string
+    var cl_str: [char8; 20] = [0; 20];
+    let cl_str_len = Itoa(&cl_str as *char8, body_len);
+    SetKnownResponseHeader(&resp as *char8, HTTP_KNOWN_HDR_CONTENT_LENGTH,
+                            &cl_str as *char8, cl_str_len);
+
+    // HTTP_DATA_CHUNK
+    var chunk: [char8; 24] = [0; 24];
+    WriteU32AtOff(&chunk as *char8, HTTPCHUNK_OFF_TYPE, 0);  // FromMemory
+    WritePtrAt(&chunk as *char8, HTTPCHUNK_OFF_P_BUFFER, body as int);
+    WriteU32AtOff(&chunk as *char8, HTTPCHUNK_OFF_BUFFER_LEN, body_len as uint32);
+
+    WriteU16At(&resp as *char8, HTTPRESP_OFF_CHUNK_COUNT, 1);
+    WritePtrAt(&resp as *char8, HTTPRESP_OFF_P_CHUNKS, &chunk as *char8 as int);
+
+    var bytes_sent: uint32 = 0;
+    HttpSendHttpResponse(req_queue, request_id, 0,
+                         &resp as *opaque, 0 as *opaque,
+                         &bytes_sent, 0 as *opaque, 0,
+                         0 as *opaque, 0 as *opaque);
+}
+
+// ── Request parsing ───────────────────────────────────────────────────────────
+
+// Converts HTTP.sys HTTP_VERB enum to our Method enum.
+func HttpSysVerb(verb_int: int) -> Method {
+    if verb_int == HTTP_VERB_GET     { return Method.GET; }
+    if verb_int == HTTP_VERB_POST    { return Method.POST; }
+    if verb_int == HTTP_VERB_PUT     { return Method.PUT; }
+    if verb_int == HTTP_VERB_DELETE  { return Method.DELETE; }
+    if verb_int == HTTP_VERB_HEAD    { return Method.HEAD; }
+    if verb_int == HTTP_VERB_OPTIONS { return Method.OPTIONS; }
+    if verb_int == HTTP_VERB_PATCH   { return Method.PATCH; }
+    return Method.UNKNOWN;
+}
+
+// Fills a Request from an HTTP.sys HTTP_REQUEST buffer.
+func ParseHttpSysRequest(req_buf: *char8, req: *Request) {
+    let buf_int = req_buf as int;
+
+    // Method
+    let verb = ReadU32At(buf_int, HTTPREQ_OFF_VERB) as int;
+    req.method = HttpSysVerb(verb);
+
+    // Raw URL (ASCII) — pRawUrl at offset 56, length at offset 42.
+    let raw_url_len = ReadU32At(buf_int, HTTPREQ_OFF_RAW_URL_LEN) as int & 0xFFFF;
+    let raw_url_ptr = ReadPtrAt(buf_int, HTTPREQ_OFF_P_RAW_URL);
+
+    if raw_url_ptr != 0 && raw_url_len > 0 {
+        let raw_url = raw_url_ptr as *char8;
+        // Split at '?'
+        var path_len: int  = 0;
+        var query_len: int = 0;
+        var in_query: bool = false;
+        var i: int = 0;
+        loop {
+            if i >= raw_url_len { break; }
+            if raw_url[i] == c8'?'[0] { in_query = true; i = i + 1; continue; }
+            if in_query {
+                if query_len < MAX_QUERY_LEN - 1 {
+                    req.query[query_len] = raw_url[i]; query_len = query_len + 1;
+                }
+            } else {
+                if path_len < MAX_PATH_LEN - 1 {
+                    req.path[path_len] = raw_url[i]; path_len = path_len + 1;
+                }
+            }
+            i = i + 1;
+        }
+        req.path[path_len]   = 0 as char8; req.path_len   = path_len;
+        req.query[query_len] = 0 as char8; req.query_len  = query_len;
+    }
+
+    // Remote IP — pRemoteAddress at offset 104 → SOCKADDR → sin_addr at +4.
+    let remote_sockaddr_ptr = ReadPtrAt(buf_int, HTTPREQ_OFF_REMOTE_ADDR);
+    if remote_sockaddr_ptr != 0 {
+        req.remote_ip = ReadU32At(remote_sockaddr_ptr, 4);
+    }
+
+    req.http_minor  = 1;
+    req.keep_alive  = false;  // HTTP.sys doesn't do keep-alive at our level
+    req.status_code = 0;
+}
+
+// ── Captured response parser ──────────────────────────────────────────────────
+//
+// After Dispatch writes an HTTP/1.1 response into a CaptureCtx buffer, this
+// function extracts the status code, reason phrase, Content-Type, and body
+// position so we can feed them to HttpSysSend.
+
+struct HttpSysCapture {
+    status_code:  uint16,
+    reason:       [char8; 64],
+    reason_len:   int,
+    content_type: [char8; 128],
+    ct_len:       int,
+    body_offset:  int,   // byte offset of body within the capture buf
+    body_len:     int,
+}
+
+func ParseCapturedResponse(buf: *char8, buf_len: int, out: *HttpSysCapture) {
+    // Defaults
+    out.status_code = 200;
+    MemCopy(&out.reason as *char8, c8"OK".data, 2); out.reason_len = 2;
+    MemCopy(&out.content_type as *char8, c8"text/plain; charset=utf-8".data, 26);
+    out.ct_len = 26;
+    out.body_offset = 0; out.body_len = 0;
+
+    if buf_len < 12 { return; }
+
+    // Status line: "HTTP/1.1 NNN Reason\r\n"
+    var i: int = 9;  // skip "HTTP/1.1 "
+    var code: int = 0;
+    loop {
+        if i >= buf_len || buf[i] == c8' '[0] || buf[i] == c8'\r'[0] { break; }
+        if buf[i] >= c8'0'[0] && buf[i] <= c8'9'[0] {
+            code = code * 10 + (buf[i] as int - 48);
+        }
+        i = i + 1;
+    }
+    out.status_code = if code > 0 { code as uint16 } else { 200 };
+
+    // Reason phrase (after the status code space)
+    if i < buf_len && buf[i] == c8' '[0] { i = i + 1; }
+    let reason_start = i;
+    loop { if i >= buf_len || buf[i] == c8'\r'[0] || buf[i] == c8'\n'[0] { break; } i = i + 1; }
+    let rlen = if i - reason_start < 63 { i - reason_start } else { 63 };
+    MemCopy(&out.reason as *char8, buf + reason_start, rlen);
+    out.reason_len = rlen;
+
+    // Skip CRLF
+    if i < buf_len && buf[i] == c8'\r'[0] { i = i + 1; }
+    if i < buf_len && buf[i] == c8'\n'[0] { i = i + 1; }
+
+    // Parse response headers
+    loop {
+        if i >= buf_len { break; }
+        if buf[i] == c8'\r'[0] && (i+1) < buf_len && buf[i+1] == c8'\n'[0] {
+            i = i + 2; break;
+        }
+        if buf[i] == c8'\n'[0] { i = i + 1; break; }
+
+        let name_start = i;
+        loop { if i >= buf_len || buf[i] == c8':'[0] || buf[i] == c8'\n'[0] { break; } i = i + 1; }
+        let name_len = i - name_start;
+        if i < buf_len && buf[i] == c8':'[0] { i = i + 1; }
+        loop { if i >= buf_len || buf[i] != c8' '[0] { break; } i = i + 1; }
+        let val_start = i;
+        loop { if i >= buf_len || buf[i] == c8'\r'[0] || buf[i] == c8'\n'[0] { break; } i = i + 1; }
+        let val_len = i - val_start;
+        if i < buf_len && buf[i] == c8'\r'[0] { i = i + 1; }
+        if i < buf_len && buf[i] == c8'\n'[0] { i = i + 1; }
+
+        if name_len == 12 && MemEqCI(buf + name_start, c8"Content-Type".data, 12) {
+            let ctlen = if val_len < 127 { val_len } else { 127 };
+            MemCopy(&out.content_type as *char8, buf + val_start, ctlen);
+            out.ct_len = ctlen;
+        }
+    }
+
+    // Body starts at i
+    out.body_offset = i;
+    out.body_len    = if i < buf_len { buf_len - i } else { 0 };
+}
+
+// ── HTTP.sys server request loop ──────────────────────────────────────────────
+//
+// Uses CaptureCtx + CAPTURE_SOCK to route every request through the full
+// Dispatch() pipeline (rate limiting, JWT, proxy, static files, DB, etc.)
+// and then feeds the captured HTTP/1.1 response through HttpSysSend.
+
+func Dispatch(sock: int, req: *Request, ctx: *ServerCtx, tls: *opaque) -> bool;
+func LogRequest(req: *Request, status: int, latency_us: int, log_fh: int);
+
+func HttpSysWorkerThread(param: *opaque) -> uint32 {
+    let ctx = param as *ServerCtx;
+    let req_queue = ctx.httpsys_handle;
+    let heap = GetProcessHeap();
+
+    // Capture buffer: 256 KB — enough for any built-in or proxied response
+    let cap_size: int = 262144;
+
+    var req_buf: [char8; 65536] = [0; 65536];
+    var req: Request = EmptyRequest();
+
+    loop {
+        MemZero(&req_buf as *char8, 65536);
+        var bytes_recv: uint32 = 0;
+
+        let rc = HttpReceiveHttpRequest(req_queue, 0, 0,
+                                         &req_buf as *char8, 65536,
+                                         &bytes_recv, 0 as *opaque);
+        if rc != 0 { continue; }
+
+        let buf_int   = &req_buf as *char8 as int;
+        let request_id = ReadPtrAt(buf_int, HTTPREQ_OFF_REQUEST_ID);
+
+        req = EmptyRequest();
+        ParseHttpSysRequest(&req_buf as *char8, &req);
+
+        MetricInc(&ctx.metrics, 0);
+        MetricInc(&ctx.metrics, 2);
+
+        // Allocate capture buffer and dispatch through full router
+        let cap_buf = HeapAlloc(heap, HEAP_ZERO_MEMORY, cap_size as uint64) as *char8;
+        if cap_buf == 0 as *char8 {
+            MetricInc(&ctx.metrics, 3);
+            continue;
+        }
+
+        var cc: CaptureCtx = CaptureCtx { buf: cap_buf, len: 0, cap: cap_size };
+
+        let t0 = QpcNow();
+        Dispatch(CAPTURE_SOCK, &req, ctx, &cc as *opaque);
+        let t1 = QpcNow();
+
+        // Parse the captured HTTP/1.1 response
+        var hsc: HttpSysCapture = HttpSysCapture {
+            status_code:  200,
+            reason:       [0; 64],
+            reason_len:   0,
+            content_type: [0; 128],
+            ct_len:        0,
+            body_offset:  0,
+            body_len:     0,
+        };
+        ParseCapturedResponse(cap_buf, cc.len, &hsc);
+
+        HttpSysSend(req_queue, request_id,
+                    hsc.status_code,
+                    &hsc.reason as *char8, hsc.reason_len,
+                    &hsc.content_type as *char8, hsc.ct_len,
+                    cap_buf + hsc.body_offset, hsc.body_len);
+
+        HeapFree(heap, 0, cap_buf as *opaque);
+
+        LogRequest(&req, req.status_code, TicksToUs(t1 - t0, ctx.qpc_freq), ctx.log_fh);
+        MetricInc(&ctx.metrics, 3);
+    }
+
+    return 0;
+}
+
+// ── RunHttpSys — called from Main ─────────────────────────────────────────────
+
+func RunHttpSys(ctx: *ServerCtx) {
+    // Initialize HTTP API v2.
+    let init_rc = HttpInitialize(HTTPAPI_VERSION_2, HTTP_INITIALIZE_SERVER,
+                                  0 as *opaque);
+    if init_rc != 0 {
+        LogStr(c8"[httpsys] HttpInitialize failed\n".data);
+        return;
+    }
+
+    // Create request queue.
+    let queue_rc = HttpCreateRequestQueue(HTTPAPI_VERSION_2,
+                                           0 as *opaque, 0 as *opaque, 0,
+                                           &ctx.httpsys_handle);
+    if queue_rc != 0 {
+        LogStr(c8"[httpsys] HttpCreateRequestQueue failed\n".data);
+        HttpTerminate(HTTP_INITIALIZE_SERVER, 0 as *opaque);
+        return;
+    }
+
+    // Register URL: "http://+:<port>/"  ('+' = all interfaces)
+    // Build as wide string: "http://+:8080/"
+    var url_a: [char8; 64] = [0; 64];
+    var ua: int = 0;
+    MemCopy(&url_a as *char8 + ua, c8"http://+:".data, 9); ua = ua + 9;
+    ua = ua + Itoa(&url_a as *char8 + ua, ctx.config.port as int);
+    url_a[ua] = c8'/'[0]; ua = ua + 1;
+
+    var url_w: [char8; 256] = [0; 256];
+    ToWide(&url_a as *char8, ua, &url_w as *char8, 256);
+
+    let add_rc = HttpAddUrl(ctx.httpsys_handle, &url_w as *char8, 0 as *opaque);
+    if add_rc != 0 {
+        var err_msg: [char8; 128] = [0; 128];
+        var ep: int = 0;
+        MemCopy(&err_msg as *char8 + ep, c8"[httpsys] HttpAddUrl failed (rc=".data, 32); ep = ep + 32;
+        ep = ep + Itoa(&err_msg as *char8 + ep, add_rc as int);
+        MemCopy(&err_msg as *char8 + ep, c8"). Run: netsh http add urlacl url=http://+:".data, 42); ep = ep + 42;
+        ep = ep + Itoa(&err_msg as *char8 + ep, ctx.config.port as int);
+        MemCopy(&err_msg as *char8 + ep, c8"/ user=Everyone\n".data, 16); ep = ep + 16;
+        Log(&err_msg as *char8, ep as uint64);
+        HttpTerminate(HTTP_INITIALIZE_SERVER, 0 as *opaque);
+        return;
+    }
+
+    LogStr(c8"[httpsys] request queue ready\n".data);
+
+    InitializeCriticalSection(&ctx.metrics.lock as *opaque);
+    InitConnPool(&ctx.conn_pool, CONN_POOL_SIZE);
+
+    // Spawn workers - 1 threads, main becomes the last.
+    let n = ctx.config.workers;
+    var i: int = 0;
+    loop {
+        if i >= n - 1 { break; }
+        var tid: uint32 = 0;
+        let th = CreateThread(0 as *opaque, 0,
+                              HttpSysWorkerThread as *opaque,
+                              ctx as *opaque, 0, &tid);
+        if th != 0 { CloseHandle(th); }
+        i = i + 1;
+    }
+
+    HttpSysWorkerThread(ctx as *opaque);
+
+    // Cleanup (unreachable in normal operation)
+    HttpRemoveUrl(ctx.httpsys_handle, &url_w as *char8);
+    HttpCloseRequestQueue(ctx.httpsys_handle);
+    HttpTerminate(HTTP_INITIALIZE_SERVER, 0 as *opaque);
+}

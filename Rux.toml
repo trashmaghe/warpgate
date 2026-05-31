@@ -1,0 +1,7 @@
+[Package]
+Name    = "warpgate"
+Version = "0.1.0"
+Type    = "lib"
+
+[Build]
+Output = "Bin"

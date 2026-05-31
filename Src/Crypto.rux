@@ -1,0 +1,141 @@
+// Warpgate — SHA-256 and HMAC-SHA256 via Windows BCrypt API
+//
+// BCrypt uses wide (UTF-16LE) strings for algorithm names.
+// SHA256_ALG_ID_WIDE (defined in Ffi.rux) = L"SHA256" as raw bytes.
+//
+// BCryptGetProperty with BCRYPT_OBJECT_LENGTH_PROPERTY (L"ObjectLength") tells
+// us how many bytes to allocate for the hash object.  We use a fixed 256-byte
+// buffer which is larger than the actual object (~192 bytes for SHA-256).
+//
+// Output: SHA-256 produces 32 bytes (SHA256_HASH_BYTES).
+
+const CRYPTO_HASH_OBJ_BUF: int = 256;  // hash object scratch buffer
+
+func ToWide(src: *char8, src_len: int, dst: *char8, dst_cap: int) -> int;
+
+// ── SHA-256 ───────────────────────────────────────────────────────────────────
+
+// Computes SHA-256 of data[0..data_len) into out[0..32).
+// Returns true on success.
+func Sha256(data: *char8, data_len: int, out: *char8) -> bool {
+    var h_alg: int  = 0;
+    var h_hash: int = 0;
+    var hash_obj: [char8; 256] = [0; 256];
+    var alg_id_w: [char8; 16]  = [0; 16];  // L"SHA256\0"
+    ToWide(c8"SHA256".data, 6, &alg_id_w as *char8, 16);
+
+    let alg_rc = BCryptOpenAlgorithmProvider(
+        &h_alg, &alg_id_w as *char8, 0 as *char8, 0);
+    if alg_rc != 0 { return false; }
+
+    let hash_rc = BCryptCreateHash(
+        h_alg, &h_hash,
+        &hash_obj as *char8, CRYPTO_HASH_OBJ_BUF as uint32,
+        0 as *char8, 0, 0);
+
+    if hash_rc != 0 {
+        BCryptCloseAlgorithmProvider(h_alg, 0);
+        return false;
+    }
+
+    BCryptHashData(h_hash, data, data_len as uint32, 0);
+    let fin_rc = BCryptFinishHash(h_hash, out, SHA256_HASH_BYTES as uint32, 0);
+
+    BCryptDestroyHash(h_hash);
+    BCryptCloseAlgorithmProvider(h_alg, 0);
+
+    return fin_rc == 0;
+}
+
+// ── HMAC-SHA256 ───────────────────────────────────────────────────────────────
+
+// Computes HMAC-SHA256 of data[0..data_len) with key[0..key_len) into out[0..32).
+func HmacSha256(key: *char8, key_len: int,
+                data: *char8, data_len: int,
+                out: *char8) -> bool {
+    var h_alg: int  = 0;
+    var h_hash: int = 0;
+    var hash_obj: [char8; 256] = [0; 256];
+    var alg_id_w: [char8; 16]  = [0; 16];
+    ToWide(c8"SHA256".data, 6, &alg_id_w as *char8, 16);
+
+    // Open with HMAC flag.
+    let alg_rc = BCryptOpenAlgorithmProvider(
+        &h_alg, &alg_id_w as *char8, 0 as *char8, BCRYPT_ALG_HANDLE_HMAC_FLAG);
+    if alg_rc != 0 { return false; }
+
+    // Pass the key when creating the hash.
+    let hash_rc = BCryptCreateHash(
+        h_alg, &h_hash,
+        &hash_obj as *char8, CRYPTO_HASH_OBJ_BUF as uint32,
+        key, key_len as uint32, 0);
+
+    if hash_rc != 0 {
+        BCryptCloseAlgorithmProvider(h_alg, 0);
+        return false;
+    }
+
+    BCryptHashData(h_hash, data, data_len as uint32, 0);
+    let fin_rc = BCryptFinishHash(h_hash, out, SHA256_HASH_BYTES as uint32, 0);
+
+    BCryptDestroyHash(h_hash);
+    BCryptCloseAlgorithmProvider(h_alg, 0);
+
+    return fin_rc == 0;
+}
+
+// ── Hex encoding ─────────────────────────────────────────────────────────────
+
+// Encodes binary[0..len) as lowercase hex into out[0..len*2).
+// out is NOT null-terminated by this function.
+func HexEncode(binary: *char8, len: int, out: *char8) -> int {
+    let hex = c8"0123456789abcdef";
+    var i: int = 0;
+    loop {
+        if i >= len { break; }
+        let b = binary[i] as int & 0xFF;
+        out[i * 2]     = hex.data[b >> 4];
+        out[i * 2 + 1] = hex.data[b & 0xF];
+        i = i + 1;
+    }
+    return len * 2;
+}
+
+// ── Sha256Hex ─────────────────────────────────────────────────────────────────
+
+// Computes SHA-256 and encodes result as 64 lowercase hex chars + null.
+// out must be at least 65 bytes.
+func Sha256Hex(data: *char8, data_len: int, out: *char8) -> bool {
+    var raw: [char8; 32] = [0; 32];
+    if !Sha256(data, data_len, &raw as *char8) { return false; }
+    let n = HexEncode(&raw as *char8, 32, out);
+    out[n] = 0 as char8;
+    return true;
+}
+
+// ── Constant-time comparison (prevents timing attacks on HMAC) ───────────────
+
+func ConstantTimeEq(a: *char8, b: *char8, n: int) -> bool {
+    var diff: int = 0;
+    var i: int = 0;
+    loop {
+        if i >= n { break; }
+        diff = diff | ((a[i] as int) ^ (b[i] as int));
+        i = i + 1;
+    }
+    return diff == 0;
+}
+
+// ── Better ETag via SHA-256 ───────────────────────────────────────────────────
+
+// Generates a strong ETag from file content: first 8 bytes of SHA-256, hex-encoded.
+// Returns the ETag string length (including surrounding quotes).
+func MakeStrongETag(file_data: *char8, file_size: int, out: *char8) -> int {
+    var raw: [char8; 32] = [0; 32];
+    if !Sha256(file_data, file_size, &raw as *char8) { return 0; }
+    out[0] = c8'"'[0];
+    let hex_len = HexEncode(&raw as *char8, 8, out + 1); // first 8 bytes = 16 hex chars
+    out[1 + hex_len] = c8'"'[0];
+    out[2 + hex_len] = 0 as char8;
+    return 2 + hex_len;
+}

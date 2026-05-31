@@ -1,0 +1,95 @@
+// Warpgate — Token-bucket rate limiting (per client IP)
+//
+// Each IP gets a token bucket: tokens refill at rps tokens/second,
+// capped at burst tokens.  Stored in a fixed-size hash table (linear probe).
+//
+// Fixed-point arithmetic: 1 token = RATE_PRECISION units.
+// Refill per millisecond: rps fixed units.
+//
+// RateLimitEntry and RateLimitTable structs are defined in Pool.rux so that
+// ServerCtx can embed them before this file is compiled.
+
+func InitRateLimitTable(t: *RateLimitTable) {
+    InitializeCriticalSection(&t.lock as *opaque);
+    var i: int = 0;
+    loop {
+        if i >= 512 { break; }
+        t.entries[i].ip        = 0;
+        t.entries[i].tokens    = 0;
+        t.entries[i].last_tick = 0;
+        t.entries[i].used      = false;
+        i = i + 1;
+    }
+}
+
+// Returns true if the request from ip is within rate limits.
+// rps = tokens per second allowed; burst = max bucket size.
+func CheckRateLimit(t: *RateLimitTable, ip: uint32, rps: int, burst: int) -> bool {
+    if rps <= 0 { return true; }
+
+    let burst_fixed = burst * RATE_PRECISION;
+    let now = GetTickCount64();
+
+    EnterCriticalSection(&t.lock as *opaque);
+
+    // Hash lookup with linear probing
+    let start = ((ip as int) & 0x7FFFFFFF) % 512;
+    var slot: int = -1;
+    var i: int = 0;
+    loop {
+        if i >= 512 { break; }
+        let idx = (start + i) % 512;
+        let e: *RateLimitEntry = &t.entries[idx] as *RateLimitEntry;
+        if !e.used {
+            if slot < 0 { slot = idx; }
+            break;
+        }
+        if e.ip == ip { slot = idx; break; }
+        i = i + 1;
+    }
+
+    if slot < 0 {
+        // Table full and no match — evict the oldest entry (smallest last_tick)
+        var oldest_idx: int = 0;
+        var oldest_tick: int = t.entries[0].last_tick;
+        var k: int = 1;
+        loop {
+            if k >= 512 { break; }
+            if t.entries[k].last_tick < oldest_tick {
+                oldest_tick = t.entries[k].last_tick;
+                oldest_idx  = k;
+            }
+            k = k + 1;
+        }
+        slot = oldest_idx;
+        // Reset the evicted slot so it gets re-initialised below
+        t.entries[slot].used = false;
+    }
+
+    let e: *RateLimitEntry = &t.entries[slot] as *RateLimitEntry;
+
+    if !e.used {
+        // New entry — start with full burst
+        e.ip        = ip;
+        e.tokens    = burst_fixed;
+        e.last_tick = now;
+        e.used      = true;
+    } else {
+        // Refill: elapsed_ms * rps fixed units
+        let elapsed_ms = now - e.last_tick;
+        if elapsed_ms > 0 {
+            e.tokens    = e.tokens + elapsed_ms * rps;
+            e.last_tick = now;
+            if e.tokens > burst_fixed { e.tokens = burst_fixed; }
+        }
+    }
+
+    var allowed: bool = false;
+    if e.tokens >= RATE_PRECISION {
+        e.tokens = e.tokens - RATE_PRECISION;
+        allowed  = true;
+    }
+
+    LeaveCriticalSection(&t.lock as *opaque);
+    return allowed;
+}

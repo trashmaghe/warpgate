@@ -1,0 +1,336 @@
+// Warpgate — Router, built-in handlers, gzip middleware
+//
+// Phase 7: Dispatch now takes client_tls (*opaque) and enforces rate limiting
+// and JWT authentication before routing.
+
+// Forward declarations
+func ConnSend(sock: int, tls: *opaque, buf: *char8, len: int) -> int;
+func SendText(sock: int, tls: *opaque, status: *char8, status_len: int,
+              body: *char8, body_len: int, keep_alive: bool);
+func SendJson(sock: int, tls: *opaque, status: *char8, status_len: int,
+              body: *char8, body_len: int, keep_alive: bool);
+func SendGzip(sock: int, tls: *opaque, status: *char8, status_len: int,
+              content_type: *char8, ct_len: int,
+              body: *char8, body_len: int, keep_alive: bool, req: *Request);
+func ServeFile(sock: int, req: *Request, ctx: *ServerCtx, tls: *opaque);
+func ProxyRequest(client_sock: int, req: *Request, ctx: *ServerCtx,
+                  client_tls: *opaque);
+func CheckRateLimit(t: *RateLimitTable, ip: uint32, rps: int, burst: int) -> bool;
+func JwtValidate(token: *char8, token_len: int,
+                  secret: *char8, secret_len: int) -> bool;
+func PathMatchesProxy(req: *Request, cfg: *Config) -> bool;
+func PathMatchesStatic(req: *Request, cfg: *Config) -> bool;
+
+// Extracts and validates the JWT from Authorization: Bearer <token>.
+// Returns true if the request is authorized (JWT valid or not required for path).
+func JwtCheck(req: *Request, ctx: *ServerCtx) -> bool {
+    if !ctx.config.jwt_enabled { return true; }
+
+    let plen = ctx.config.jwt_prefix_len;
+    if plen > 0 {
+        if req.path_len < plen { return true; }
+        if !MemEq(&req.path as *char8, &ctx.config.jwt_prefix as *char8, plen) {
+            return true;
+        }
+    }
+
+    let auth = GetHeader(req, c8"Authorization".data, 13);
+    if auth == 0 as *char8 { return false; }
+    let alen = StrLen(auth);
+    if alen < 8 { return false; }
+    if !MemEqCI(auth, c8"Bearer ".data, 7) { return false; }
+
+    return JwtValidate(auth + 7, alen - 7,
+                       &ctx.config.jwt_secret as *char8,
+                       ctx.config.jwt_secret_len);
+}
+
+func PathEq(req: *Request, lit: *char8, lit_len: int) -> bool {
+    if req.path_len != lit_len { return false; }
+    return MemEq(&req.path as *char8, lit, lit_len);
+}
+
+// ── Gzip middleware wrapper ───────────────────────────────────────────────────
+
+func RespondText(sock: int, req: *Request, ctx: *ServerCtx, tls: *opaque,
+                 status: *char8, status_len: int,
+                 body: *char8, body_len: int) {
+    if ctx.config.gzip_enabled && body_len >= ctx.config.gzip_min_bytes {
+        SendGzip(sock, tls, status, status_len,
+                 c8"text/plain; charset=utf-8".data, 26,
+                 body, body_len, req.keep_alive, req);
+    } else {
+        SendText(sock, tls, status, status_len, body, body_len, req.keep_alive);
+    }
+}
+
+func RespondJson(sock: int, req: *Request, ctx: *ServerCtx, tls: *opaque,
+                 status: *char8, status_len: int,
+                 body: *char8, body_len: int) {
+    if ctx.config.gzip_enabled && body_len >= ctx.config.gzip_min_bytes {
+        SendGzip(sock, tls, status, status_len,
+                 c8"application/json".data, 16,
+                 body, body_len, req.keep_alive, req);
+    } else {
+        SendJson(sock, tls, status, status_len, body, body_len, req.keep_alive);
+    }
+}
+
+// ── Built-in handlers ─────────────────────────────────────────────────────────
+
+func HandleRoot(sock: int, req: *Request, ctx: *ServerCtx, tls: *opaque) {
+    req.status_code = 200;
+    let body = c8"Warpgate is alive!\n";
+    RespondText(sock, req, ctx, tls, c8"200 OK".data, 6,
+                body.data, body.length as int);
+}
+
+func HandleHealth(sock: int, req: *Request, ctx: *ServerCtx, tls: *opaque) {
+    req.status_code = 200;
+    var body: [char8; 256] = [0; 256];
+    var p: int = 0;
+    MemCopy(&body as *char8 + p, c8"{\"status\":\"ok\",\"queue\":".data, 22); p = p + 22;
+    p = p + Itoa(&body as *char8 + p, ctx.queue.count);
+    MemCopy(&body as *char8 + p, c8",\"workers\":".data, 11); p = p + 11;
+    p = p + Itoa(&body as *char8 + p, ctx.config.workers);
+    MemCopy(&body as *char8 + p, c8",\"upstreams\":".data, 13); p = p + 13;
+    p = p + Itoa(&body as *char8 + p, ctx.up_pool.count);
+    MemCopy(&body as *char8 + p, c8"}\n".data, 2); p = p + 2;
+    RespondJson(sock, req, ctx, tls, c8"200 OK".data, 6, &body as *char8, p);
+}
+
+func HandleMetrics(sock: int, req: *Request, ctx: *ServerCtx, tls: *opaque) {
+    req.status_code = 200;
+    var body: [char8; 1024] = [0; 1024];
+    var p: int = 0;
+
+    EnterCriticalSection(&ctx.metrics.lock as *opaque);
+    let total  = ctx.metrics.requests_total;
+    let errors = ctx.metrics.requests_error;
+    let active = ctx.metrics.active;
+    LeaveCriticalSection(&ctx.metrics.lock as *opaque);
+
+    MemCopy(&body as *char8 + p, c8"warpgate_requests_total ".data, 24);    p = p + 24;
+    p = p + Itoa(&body as *char8 + p, total); body[p] = c8'\n'[0]; p = p + 1;
+
+    MemCopy(&body as *char8 + p, c8"warpgate_requests_error ".data, 24);    p = p + 24;
+    p = p + Itoa(&body as *char8 + p, errors); body[p] = c8'\n'[0]; p = p + 1;
+
+    MemCopy(&body as *char8 + p, c8"warpgate_active_connections ".data, 28); p = p + 28;
+    p = p + Itoa(&body as *char8 + p, active); body[p] = c8'\n'[0]; p = p + 1;
+
+    MemCopy(&body as *char8 + p, c8"warpgate_queue_depth ".data, 21);       p = p + 21;
+    p = p + Itoa(&body as *char8 + p, ctx.queue.count); body[p] = c8'\n'[0]; p = p + 1;
+
+    var i: int = 0;
+    loop {
+        if i >= ctx.up_pool.count { break; }
+        let up: *UpstreamDef = &ctx.up_pool.upstreams[i] as *UpstreamDef;
+        MemCopy(&body as *char8 + p, c8"warpgate_upstream_healthy{id=\"".data, 30); p = p + 30;
+        p = p + Itoa(&body as *char8 + p, i);
+        MemCopy(&body as *char8 + p, c8"\"} ".data, 3); p = p + 3;
+        body[p] = if up.healthy { c8'1'[0] } else { c8'0'[0] }; p = p + 1;
+        body[p] = c8'\n'[0]; p = p + 1;
+        i = i + 1;
+    }
+
+    var out: [char8; 8192] = [0; 8192];
+    let len = BuildResponse(&out as *char8, 8192,
+                            c8"200 OK".data, 6,
+                            c8"text/plain; version=0.0.4".data, 25,
+                            &body as *char8, p, req.keep_alive);
+    ConnSend(sock, tls, &out as *char8, len);
+}
+
+func HandleEcho(sock: int, req: *Request, ctx: *ServerCtx, tls: *opaque) {
+    req.status_code = 200;
+    if req.body_len > 0 {
+        let ct = GetHeader(req, c8"Content-Type".data, 12);
+        if ct != 0 as *char8 {
+            let ctl = StrLen(ct);
+            if ctx.config.gzip_enabled && req.body_len >= ctx.config.gzip_min_bytes {
+                SendGzip(sock, tls, c8"200 OK".data, 6, ct, ctl,
+                         &req.body as *char8, req.body_len, req.keep_alive, req);
+            } else {
+                var out: [char8; 8192] = [0; 8192];
+                let len = BuildResponse(&out as *char8, 8192, c8"200 OK".data, 6,
+                                        ct, ctl, &req.body as *char8, req.body_len,
+                                        req.keep_alive);
+                ConnSend(sock, tls, &out as *char8, len);
+            }
+        } else {
+            RespondText(sock, req, ctx, tls, c8"200 OK".data, 6,
+                        &req.body as *char8, req.body_len);
+        }
+    } else {
+        RespondText(sock, req, ctx, tls, c8"200 OK".data, 6,
+                    c8"(no body)\n".data, 10);
+    }
+}
+
+// ── Database route handlers ───────────────────────────────────────────────────
+
+func HandleDbQuery(sock: int, req: *Request, ctx: *ServerCtx, tls: *opaque) {
+    if !ctx.db_enabled {
+        req.status_code = 503;
+        SendText(sock, tls, c8"503 Service Unavailable".data, 23,
+                 c8"database not enabled\n".data, 21, false);
+        return;
+    }
+
+    var sql: [char8; 512] = [0; 512];
+    var sql_len: int = 0;
+    let qs = &req.query as *char8;
+    let ql = req.query_len;
+    var i: int = 0;
+    loop {
+        if i + 3 >= ql { break; }
+        if MemEq(qs + i, c8"sql=".data, 4) {
+            sql_len = UrlDecode(qs + i + 4, ql - i - 4, &sql as *char8);
+            break;
+        }
+        i = i + 1;
+    }
+
+    if sql_len == 0 {
+        req.status_code = 400;
+        SendText(sock, tls, c8"400 Bad Request".data, 15,
+                 c8"missing ?sql= parameter\n".data, 24, false);
+        return;
+    }
+
+    if MemEqCI(&sql as *char8, c8"INSERT".data, 6) ||
+       MemEqCI(&sql as *char8, c8"UPDATE".data, 6) ||
+       MemEqCI(&sql as *char8, c8"DELETE".data, 6) ||
+       MemEqCI(&sql as *char8, c8"DROP".data, 4)   ||
+       MemEqCI(&sql as *char8, c8"CREATE".data, 6) {
+        req.status_code = 403;
+        SendText(sock, tls, c8"403 Forbidden".data, 13,
+                 c8"write operations require POST /db/exec\n".data, 38, false);
+        return;
+    }
+
+    let heap = GetProcessHeap();
+    let out_buf = HeapAlloc(heap, HEAP_ZERO_MEMORY, 65536 as uint64) as *char8;
+    if out_buf == 0 as *char8 {
+        req.status_code = 500;
+        SendText(sock, tls, c8"500 Internal Server Error".data, 25,
+                 c8"out of memory\n".data, 14, false);
+        return;
+    }
+
+    let out_len = DbQuery(&ctx.db, &sql as *char8, out_buf, 65536);
+    req.status_code = 200;
+    RespondJson(sock, req, ctx, tls, c8"200 OK".data, 6, out_buf, out_len);
+    HeapFree(heap, 0, out_buf as *opaque);
+}
+
+func HandleDbExec(sock: int, req: *Request, ctx: *ServerCtx, tls: *opaque) {
+    if !ctx.db_enabled {
+        req.status_code = 503;
+        SendText(sock, tls, c8"503 Service Unavailable".data, 23,
+                 c8"database not enabled\n".data, 21, false);
+        return;
+    }
+
+    if req.body_len == 0 {
+        req.status_code = 400;
+        SendText(sock, tls, c8"400 Bad Request".data, 15,
+                 c8"empty body\n".data, 11, false);
+        return;
+    }
+
+    var sql: [char8; 16384] = [0; 16384];
+    var copy: int = req.body_len;
+    if copy >= 16383 { copy = 16383; }
+    MemCopy(&sql as *char8, &req.body as *char8, copy);
+    sql[copy] = 0 as char8;
+
+    if DbExec(&ctx.db, &sql as *char8) {
+        req.status_code = 200;
+        SendJson(sock, tls, c8"200 OK".data, 6,
+                 c8"{\"ok\":true}\n".data, 12, req.keep_alive);
+    } else {
+        req.status_code = 500;
+        SendJson(sock, tls, c8"500 Internal Server Error".data, 25,
+                 c8"{\"ok\":false}\n".data, 13, false);
+    }
+}
+
+// ── Error helpers ─────────────────────────────────────────────────────────────
+
+func Send404(sock: int, req: *Request, tls: *opaque) {
+    req.status_code = 404;
+    SendText(sock, tls, c8"404 Not Found".data, 13,
+             c8"404 Not Found\n".data, 14, false);
+}
+
+func Send405(sock: int, req: *Request, tls: *opaque) {
+    req.status_code = 405;
+    SendText(sock, tls, c8"405 Method Not Allowed".data, 22,
+             c8"405 Method Not Allowed\n".data, 23, false);
+}
+
+// ── Dispatch ──────────────────────────────────────────────────────────────────
+//
+// client_tls: 0 as *opaque for plain TCP, *TlsConn cast for inbound TLS.
+
+func Dispatch(sock: int, req: *Request, ctx: *ServerCtx, tls: *opaque) -> bool {
+    if req.method == Method.UNKNOWN { Send405(sock, req, tls); return false; }
+
+    // ── Rate limiting ─────────────────────────────────────────────────────────
+    if ctx.config.rate_limit_enabled {
+        if !CheckRateLimit(&ctx.rate_limit, req.remote_ip,
+                           ctx.config.rate_limit_rps, ctx.config.rate_limit_burst) {
+            req.status_code = 429;
+            SendText(sock, tls, c8"429 Too Many Requests".data, 21,
+                     c8"rate limit exceeded\n".data, 20, false);
+            return false;
+        }
+    }
+
+    // ── JWT authentication ────────────────────────────────────────────────────
+    if !JwtCheck(req, ctx) {
+        req.status_code = 401;
+        SendText(sock, tls, c8"401 Unauthorized".data, 16,
+                 c8"Unauthorized\n".data, 13, false);
+        return false;
+    }
+
+    let ka = req.keep_alive;
+
+    if req.method == Method.GET && PathEq(req, c8"/".data, 1) {
+        HandleRoot(sock, req, ctx, tls); return ka;
+    }
+    if (req.method == Method.GET || req.method == Method.HEAD) &&
+       PathEq(req, c8"/health".data, 7) {
+        HandleHealth(sock, req, ctx, tls); return ka;
+    }
+    if req.method == Method.GET && PathEq(req, c8"/metrics".data, 8) {
+        HandleMetrics(sock, req, ctx, tls); return ka;
+    }
+    if req.method == Method.POST && PathEq(req, c8"/echo".data, 5) {
+        HandleEcho(sock, req, ctx, tls); return ka;
+    }
+    if req.method == Method.GET && PathEq(req, c8"/db/query".data, 9) {
+        HandleDbQuery(sock, req, ctx, tls); return ka;
+    }
+    if req.method == Method.POST && PathEq(req, c8"/db/exec".data, 8) {
+        HandleDbExec(sock, req, ctx, tls); return ka;
+    }
+
+    if ctx.config.proxy_enabled && PathMatchesProxy(req, &ctx.config) {
+        ProxyRequest(sock, req, ctx, tls); return ka;
+    }
+    if ctx.config.static_enabled && PathMatchesStatic(req, &ctx.config) {
+        ServeFile(sock, req, ctx, tls); return ka;
+    }
+
+    if ctx.user_handler != 0 as *opaque {
+        let fn = ctx.user_handler as func(int, *Request, *ServerCtx, *opaque) -> bool;
+        return fn(sock, req, ctx, tls);
+    }
+
+    Send404(sock, req, tls);
+    return false;
+}

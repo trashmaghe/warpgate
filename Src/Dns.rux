@@ -1,0 +1,97 @@
+// Warpgate — Hostname resolution
+//
+// ResolveHost(host) -> uint32 (network byte order IP, or INADDR_NONE)
+//
+// Strategy:
+//   1. Try inet_addr — zero-cost for dotted-decimal inputs.
+//   2. Call getaddrinfo and walk the linked list for the first AF_INET result.
+//
+// Reading addrinfo* fields requires pointer arithmetic on a void pointer.
+// We use ReadU32At / ReadI64At helpers that treat any int-as-pointer as a
+// byte array — safe on x86-64 little-endian Windows.
+//
+// addrinfo layout on Win64 (ws2tcpip.h):
+//   offset  0 : ai_flags     (int,    4 bytes)
+//   offset  4 : ai_family    (int,    4 bytes)
+//   offset  8 : ai_socktype  (int,    4 bytes)
+//   offset 12 : ai_protocol  (int,    4 bytes)
+//   offset 16 : ai_addrlen   (size_t, 8 bytes)
+//   offset 24 : ai_canonname (*char8, 8 bytes)
+//   offset 32 : ai_addr      (*sockaddr, 8 bytes)
+//   offset 40 : ai_next      (*addrinfo, 8 bytes)
+//   total: 48 bytes
+//
+// sockaddr_in layout:
+//   offset 0 : sin_family (uint16, 2)
+//   offset 2 : sin_port   (uint16, 2)
+//   offset 4 : sin_addr   (uint32, 4)  ← network byte order IP
+
+// Reads a little-endian uint32 from memory at (ptr_as_int + byte_offset).
+func ReadU32At(ptr: int, offset: int) -> uint32 {
+    let b = ptr as *char8;
+    let b0 = b[offset + 0] as uint32;
+    let b1 = b[offset + 1] as uint32;
+    let b2 = b[offset + 2] as uint32;
+    let b3 = b[offset + 3] as uint32;
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+// Reads a little-endian 64-bit pointer from memory at (ptr_as_int + byte_offset).
+func ReadPtrAt(ptr: int, offset: int) -> int {
+    let b = ptr as *char8;
+    let b0 = b[offset + 0] as int;
+    let b1 = b[offset + 1] as int;
+    let b2 = b[offset + 2] as int;
+    let b3 = b[offset + 3] as int;
+    let b4 = b[offset + 4] as int;
+    let b5 = b[offset + 5] as int;
+    let b6 = b[offset + 6] as int;
+    let b7 = b[offset + 7] as int;
+    return b0        | (b1 << 8)  | (b2 << 16) | (b3 << 24) |
+           (b4 << 32) | (b5 << 40) | (b6 << 48) | (b7 << 56);
+}
+
+// Resolves a hostname or dotted-decimal string to a network-byte-order IPv4 address.
+// Returns INADDR_NONE on failure.
+func ResolveHost(host: *char8) -> uint32 {
+    // Fast path: dotted-decimal requires no syscall.
+    let quick = inet_addr(host);
+    if quick != INADDR_NONE { return quick; }
+
+    // getaddrinfo wants a null-terminated hostname, which host already is.
+    // We pass null hints to accept any address family; we'll filter for AF_INET.
+    // The result is written into an 8-byte slot (pointer-sized on Win64).
+    var ai_slot: [char8; 8] = [0; 8];
+    let rc = getaddrinfo(host, 0 as *char8, 0 as *opaque,
+                         &ai_slot as *opaque);
+    if rc != 0 { return INADDR_NONE; }
+
+    // ai_slot now holds the addrinfo* pointer.
+    let first_ai = ReadPtrAt(&ai_slot as *char8 as int, 0);
+    if first_ai == 0 { return INADDR_NONE; }
+
+    var result: uint32 = INADDR_NONE;
+    var ai: int = first_ai;
+
+    loop {
+        if ai == 0 { break; }
+
+        // ai_family is at offset 4 — filter for AF_INET (2).
+        let family = ReadU32At(ai, 4) as int;
+        if family == AF_INET {
+            // ai_addr pointer is at offset 32.
+            let sockaddr_ptr = ReadPtrAt(ai, 32);
+            if sockaddr_ptr != 0 {
+                // sin_addr is at offset 4 in sockaddr_in.
+                result = ReadU32At(sockaddr_ptr, 4);
+            }
+            break;
+        }
+
+        // ai_next pointer is at offset 40.
+        ai = ReadPtrAt(ai, 40);
+    }
+
+    freeaddrinfo(first_ai as *opaque);
+    return result;
+}

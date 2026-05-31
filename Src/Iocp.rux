@@ -1,0 +1,362 @@
+// Warpgate — I/O Completion Port transport
+//
+// Architecture:
+//   - IOCP handle associated with the listen socket and every accepted socket.
+//   - ACCEPT_POOL pre-posted AcceptEx operations keep the kernel accept pipeline full.
+//   - Workers call GetQueuedCompletionStatus, handle OP_ACCEPT or OP_RECV.
+//   - Dispatch (parse + route + send) is synchronous inside the worker; only
+//     the waiting for data is kernel-managed, so workers are never idle-blocked.
+//
+// PerIoData has OVERLAPPED at offset 0 — required because GetQueuedCompletionStatus
+// returns the OVERLAPPED pointer and we cast it to *PerIoData.
+//
+// WSABUF layout on Win64 (MSVC): { ULONG len at offset 0, CHAR* buf at offset 8 }
+// Total: 16 bytes (4 len + 4 implicit pad + 8 ptr).
+
+const OP_ACCEPT: int = 1;
+const OP_RECV:   int = 2;
+
+struct PerIoData {
+    ovl:         [char8; 32],   // OVERLAPPED — must be at offset 0
+    op_type:     int,
+    sock:        int,           // live client socket (OP_RECV/OP_SEND)
+    accept_sock: int,           // pre-created accept socket (OP_ACCEPT)
+    remote_ip:   uint32,
+    recv_flags:  uint32,
+    recv_bytes:  uint32,
+    _pad:        uint32,
+    wsa_buf:     [char8; 16],   // WSABUF
+    recv_buf:    [char8; 8192],
+    addr_buf:    [char8; 64],   // AcceptEx address buffer (32 local + 32 remote)
+    ka_count:    int,
+}
+
+// sizeof(PerIoData) ≈ 32+8+8+8+4+4+4+4+16+8192+64+8 = 8352 bytes
+
+// ── WSABUF helper ─────────────────────────────────────────────────────────────
+
+func WriteWsaBuf(buf: *char8, data_len: uint32, data_ptr: int) {
+    buf[0] = (data_len & 0xFF) as char8;
+    buf[1] = ((data_len >> 8)  & 0xFF) as char8;
+    buf[2] = ((data_len >> 16) & 0xFF) as char8;
+    buf[3] = ((data_len >> 24) & 0xFF) as char8;
+    // 4 bytes natural padding before the pointer
+    buf[4] = 0 as char8; buf[5] = 0 as char8;
+    buf[6] = 0 as char8; buf[7] = 0 as char8;
+    // pointer (little-endian 8 bytes)
+    var i: int = 0;
+    var v: int = data_ptr;
+    loop {
+        if i >= 8 { break; }
+        buf[8 + i] = (v & 0xFF) as char8;
+        v = v >> 8;
+        i = i + 1;
+    }
+}
+
+// ── Pre-post an AcceptEx ──────────────────────────────────────────────────────
+
+func PostAccept(listen_sock: int, heap: int) -> bool {
+    let per = HeapAlloc(heap, HEAP_ZERO_MEMORY, 8352 as uint64) as *PerIoData;
+    if per == 0 as *PerIoData { return false; }
+
+    per.op_type     = OP_ACCEPT;
+    per.accept_sock = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP,
+                                 0 as *opaque, 0, WSA_FLAG_OVERLAPPED);
+    if per.accept_sock == INVALID_SOCKET {
+        HeapFree(heap, 0, per as *opaque);
+        return false;
+    }
+
+    // AcceptEx with recv_len=0 — only capture addresses, no initial data.
+    // Each address slot = sizeof(sockaddr_in) + 16 = 32 bytes.
+    var bytes_recv: uint32 = 0;
+    let ok = AcceptEx(listen_sock, per.accept_sock,
+                      &per.addr_buf as *char8,
+                      0, 32, 32, &bytes_recv,
+                      &per.ovl as *opaque);
+
+    if !ok && WSAGetLastError() != WSA_IO_PENDING {
+        closesocket(per.accept_sock);
+        HeapFree(heap, 0, per as *opaque);
+        return false;
+    }
+
+    return true;
+}
+
+// ── Post an async recv ────────────────────────────────────────────────────────
+
+func PostRecv(per: *PerIoData) -> bool {
+    per.op_type    = OP_RECV;
+    per.recv_flags = 0;
+    per.recv_bytes = 0;
+    MemZero(&per.ovl as *char8, 32);
+    MemZero(&per.recv_buf as *char8, 8192);
+
+    WriteWsaBuf(&per.wsa_buf as *char8, 8192 as uint32,
+                &per.recv_buf as *char8 as int);
+
+    let ret = WSARecv(per.sock, &per.wsa_buf as *opaque, 1,
+                      &per.recv_bytes, &per.recv_flags,
+                      &per.ovl as *opaque, 0 as *opaque);
+
+    if ret != 0 && WSAGetLastError() != WSA_IO_PENDING {
+        return false;
+    }
+    return true;
+}
+
+// ── IOCP worker ───────────────────────────────────────────────────────────────
+
+// Forward declarations
+func Dispatch(sock: int, req: *Request, ctx: *ServerCtx, tls: *opaque) -> bool;
+func SendText(sock: int, tls: *opaque, status: *char8, status_len: int,
+              body: *char8, body_len: int, keep_alive: bool);
+func LogRequest(req: *Request, status: int, latency_us: int, log_fh: int);
+func TlsServerAccept(tls: *TlsConn, lo: int, hi: int) -> bool;
+func TlsClose(tls: *TlsConn);
+func ConnRecv(sock: int, tls: *opaque, buf: *char8, cap: int) -> int;
+func TlsGetAlpn(ctx_lower: int, ctx_upper: int, out: *char8, out_cap: int) -> int;
+func HandleHttp2Conn(sock: int, tls: *opaque, ctx: *ServerCtx);
+
+@[Export]
+func IocpWorkerThread(param: *opaque) -> uint32 {
+    let ctx = param as *ServerCtx;
+
+    var req: Request = EmptyRequest();
+
+    loop {
+        var bytes: uint32 = 0;
+        var key:   int    = 0;
+        var ovl_int: int  = 0;
+
+        // GetQueuedCompletionStatus writes the OVERLAPPED* into ovl_int.
+        let gqcs_ok = GetQueuedCompletionStatus(
+            ctx.iocp_handle, &bytes, &key,
+            &ovl_int as *opaque, INFINITE);
+
+        if ovl_int == 0 { continue; }
+
+        let per = ovl_int as *PerIoData;
+
+        if !gqcs_ok {
+            // I/O error on this connection.
+            if per.op_type == OP_RECV && per.sock != 0 {
+                closesocket(per.sock);
+            }
+            HeapFree(ctx.heap, 0, per as *opaque);
+            continue;
+        }
+
+        // ── Accept completion ─────────────────────────────────────────────────
+        if per.op_type == OP_ACCEPT {
+            let client = per.accept_sock;
+
+            // Inherit the listen socket's properties.
+            setsockopt(client, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
+                       &ctx.listen_sock as *char8, 8);
+
+            // Extract remote IP from AcceptEx address buffer.
+            var local_ptr: int = 0; var local_len: int = 0;
+            var remote_ptr: int = 0; var remote_len: int = 0;
+            GetAcceptExSockaddrs(&per.addr_buf as *char8, 0, 32, 32,
+                                  &local_ptr as *opaque,  &local_len,
+                                  &remote_ptr as *opaque, &remote_len);
+
+            var remote_ip: uint32 = 0;
+            if remote_ptr != 0 { remote_ip = ReadU32At(remote_ptr, 4); }
+
+            // Associate client socket with IOCP.
+            CreateIoCompletionPort(client, ctx.iocp_handle, ctx as int, 0);
+
+            // Set I/O timeouts.
+            var rcv_ms: uint32 = RECV_TIMEOUT_MS;
+            var snd_ms: uint32 = SEND_TIMEOUT_MS;
+            setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &rcv_ms as *char8, 4);
+            setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &snd_ms as *char8, 4);
+
+            // Replenish the accept pool immediately (before possibly blocking on TLS).
+            PostAccept(ctx.listen_sock, ctx.heap);
+
+            // ── Inbound TLS: degrade to synchronous handling in this worker ───
+            if ctx.config.tls_enabled && ctx.srv_cred_lower != 0 {
+                var conn_tls: TlsConn = EmptyTlsConn(client);
+                if !TlsServerAccept(&conn_tls, ctx.srv_cred_lower, ctx.srv_cred_upper) {
+                    closesocket(client);
+                    HeapFree(ctx.heap, 0, per as *opaque);
+                    continue;
+                }
+                let tls_ptr: *opaque = &conn_tls as *opaque;
+
+                // ALPN: check if HTTP/2 was negotiated
+                var alpn_buf: [char8; 32] = [0; 32];
+                let alpn_len = TlsGetAlpn(conn_tls.ctx_lower, conn_tls.ctx_upper,
+                                           &alpn_buf as *char8, 32);
+                if ctx.http2_enabled && alpn_len == 2 &&
+                   alpn_buf[0] == c8'h'[0] && alpn_buf[1] == c8'2'[0] {
+                    HandleHttp2Conn(client, tls_ptr, ctx);
+                } else {
+                    // HTTP/1.1 over TLS
+                    var raw: [char8; 8192] = [0; 8192];
+                    var req2: Request = EmptyRequest();
+                    var ka_count: int = 0;
+                    loop {
+                        MemZero(&raw as *char8, 8192);
+                        req2 = EmptyRequest(); req2.remote_ip = remote_ip;
+                        let n = ConnRecv(client, tls_ptr, &raw as *char8, RECV_BUF_SIZE);
+                        if n <= 0 { break; }
+                        let ok = ParseRequest(&raw as *char8, n, &req2);
+                        if !ok {
+                            SendText(client, tls_ptr, c8"400 Bad Request".data, 15,
+                                     c8"400 Bad Request\n".data, 16, false);
+                            MetricInc(&ctx.metrics, 1); break;
+                        }
+                        MetricInc(&ctx.metrics, 0); MetricInc(&ctx.metrics, 2);
+                        let t0 = QpcNow();
+                        let keep = Dispatch(client, &req2, ctx, tls_ptr);
+                        let t1 = QpcNow();
+                        LogRequest(&req2, req2.status_code,
+                                   TicksToUs(t1 - t0, ctx.qpc_freq), ctx.log_fh);
+                        MetricInc(&ctx.metrics, 3);
+                        if !keep { break; }
+                        ka_count = ka_count + 1;
+                        if ka_count >= MAX_KEEPALIVE_REQUESTS { break; }
+                    }
+                }
+                if conn_tls.initialized { TlsClose(&conn_tls); }
+                closesocket(client);
+                HeapFree(ctx.heap, 0, per as *opaque);
+                continue;
+            }
+
+            // ── Plain HTTP/2 (h2c) detection ─────────────────────────────────
+            if ctx.http2_enabled {
+                // Peek at first 24 bytes for the HTTP/2 connection preface
+                var peek: [char8; 24] = [0; 24];
+                let pn = recv(client, &peek as *char8, 24, 2);  // MSG_PEEK=2
+                if pn == 24 && MemEq(&peek as *char8, c8"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".data, 24) {
+                    HandleHttp2Conn(client, 0 as *opaque, ctx);
+                    closesocket(client);
+                    HeapFree(ctx.heap, 0, per as *opaque);
+                    continue;
+                }
+            }
+
+            // Reuse this PerIoData for the async recv pipeline (plain HTTP/1.1).
+            per.sock      = client;
+            per.remote_ip = remote_ip;
+            per.ka_count  = 0;
+
+            if !PostRecv(per) {
+                closesocket(client);
+                HeapFree(ctx.heap, 0, per as *opaque);
+            }
+            continue;
+        }
+
+        // ── Recv completion ───────────────────────────────────────────────────
+        if per.op_type == OP_RECV {
+            if bytes == 0 {
+                // Remote closed the connection cleanly.
+                closesocket(per.sock);
+                HeapFree(ctx.heap, 0, per as *opaque);
+                continue;
+            }
+
+            req = EmptyRequest();
+            req.remote_ip = per.remote_ip;
+
+            MetricInc(&ctx.metrics, 0);  // requests_total
+            MetricInc(&ctx.metrics, 2);  // active++
+
+            let t0 = QpcNow();
+            let parse_ok = ParseRequest(&per.recv_buf as *char8,
+                                         bytes as int, &req);
+
+            if !parse_ok {
+                SendText(per.sock, 0 as *opaque,
+                         c8"400 Bad Request".data, 15,
+                         c8"400 Bad Request\n".data, 16, false);
+                MetricInc(&ctx.metrics, 1);  // error
+                MetricInc(&ctx.metrics, 3);  // active--
+                closesocket(per.sock);
+                HeapFree(ctx.heap, 0, per as *opaque);
+                continue;
+            }
+
+            // Dispatch is synchronous — sends response before returning.
+            // IOCP transport does not support inbound TLS (pass 0).
+            let keep = Dispatch(per.sock, &req, ctx, 0 as *opaque);
+            let t1 = QpcNow();
+            LogRequest(&req, req.status_code, TicksToUs(t1 - t0, ctx.qpc_freq), ctx.log_fh);
+
+            MetricInc(&ctx.metrics, 3);  // active--
+
+            if keep && per.ka_count < MAX_KEEPALIVE_REQUESTS {
+                per.ka_count = per.ka_count + 1;
+                if !PostRecv(per) {
+                    closesocket(per.sock);
+                    HeapFree(ctx.heap, 0, per as *opaque);
+                }
+            } else {
+                closesocket(per.sock);
+                HeapFree(ctx.heap, 0, per as *opaque);
+            }
+        }
+    }
+
+    return 0;
+}
+
+// ── RunIocp — called from Main ────────────────────────────────────────────────
+
+func RunIocp(ctx: *ServerCtx) {
+    // Create the IOCP kernel object.
+    ctx.iocp_handle = CreateIoCompletionPort(
+        INVALID_HANDLE_VALUE, 0, 0, 0);
+
+    if ctx.iocp_handle == 0 {
+        LogStr(c8"[iocp] CreateIoCompletionPort failed\n".data);
+        return;
+    }
+
+    // Associate listen socket with IOCP.
+    CreateIoCompletionPort(ctx.listen_sock, ctx.iocp_handle, ctx as int, 0);
+
+    InitializeCriticalSection(&ctx.metrics.lock as *opaque);
+    InitConnPool(&ctx.conn_pool, CONN_POOL_SIZE);
+
+    // Pre-post the accept pool.
+    var i: int = 0;
+    loop {
+        if i >= IOCP_ACCEPT_POOL { break; }
+        PostAccept(ctx.listen_sock, ctx.heap);
+        i = i + 1;
+    }
+
+    var msg: [char8; 64] = [0; 64];
+    var p: int = 0;
+    MemCopy(&msg as *char8, c8"[iocp] ".data, 7); p = 7;
+    p = p + Itoa(&msg as *char8 + p, IOCP_ACCEPT_POOL);
+    MemCopy(&msg as *char8 + p, c8" accepts posted, ".data, 17); p = p + 17;
+    p = p + Itoa(&msg as *char8 + p, ctx.config.workers);
+    MemCopy(&msg as *char8 + p, c8" workers\n".data, 9); p = p + 9;
+    Log(&msg as *char8, p as uint64);
+
+    // Spawn workers - 1 threads (main thread becomes the last worker).
+    let n = ctx.config.workers;
+    var j: int = 0;
+    loop {
+        if j >= n - 1 { break; }
+        var tid: uint32 = 0;
+        let th = CreateThread(0 as *opaque, 0,
+                              IocpWorkerThread as *opaque,
+                              ctx as *opaque, 0, &tid);
+        if th != 0 { CloseHandle(th); }
+        j = j + 1;
+    }
+
+    // Main thread is the last worker — never returns.
+    IocpWorkerThread(ctx as *opaque);
+}

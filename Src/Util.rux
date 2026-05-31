@@ -1,0 +1,220 @@
+// Warpgate — Low-level utilities (no FFI, no allocations)
+
+// ── Memory ────────────────────────────────────────────────────────────────────
+
+func MemCopy(dst: *char8, src: *char8, n: int) {
+    var i: int = 0;
+    loop {
+        if i >= n { return; }
+        dst[i] = src[i];
+        i = i + 1;
+    }
+}
+
+func MemEq(a: *char8, b: *char8, n: int) -> bool {
+    var i: int = 0;
+    loop {
+        if i >= n { return true; }
+        if a[i] != b[i] { return false; }
+        i = i + 1;
+    }
+}
+
+func MemZero(dst: *char8, n: int) {
+    var i: int = 0;
+    loop {
+        if i >= n { return; }
+        dst[i] = 0 as char8;
+        i = i + 1;
+    }
+}
+
+// ── Strings ───────────────────────────────────────────────────────────────────
+
+func StrLen(s: *char8) -> int {
+    var i: int = 0;
+    loop {
+        if s[i] == 0 as char8 { return i; }
+        i = i + 1;
+    }
+}
+
+func ToLower(c: char8) -> char8 {
+    if c >= c8'A'[0] && c <= c8'Z'[0] {
+        return (c as int + 32) as char8;
+    }
+    return c;
+}
+
+// Case-insensitive comparison of n bytes.
+func MemEqCI(a: *char8, b: *char8, n: int) -> bool {
+    var i: int = 0;
+    loop {
+        if i >= n { return true; }
+        if ToLower(a[i]) != ToLower(b[i]) { return false; }
+        i = i + 1;
+    }
+}
+
+// Writes decimal representation of n into dst. Returns byte count written.
+func Itoa(dst: *char8, n: int) -> int {
+    if n == 0 {
+        dst[0] = c8'0'[0];
+        return 1;
+    }
+    var tmp: [char8; 20] = [0; 20];
+    var d: int = 0;
+    var v: int = n;
+    loop {
+        if v == 0 { break; }
+        tmp[d] = ((v % 10) + 48) as char8;
+        v = v / 10;
+        d = d + 1;
+    }
+    // Reverse digits
+    var lo: int = 0;
+    var hi: int = d - 1;
+    loop {
+        if lo >= hi { break; }
+        let t = tmp[lo];
+        tmp[lo] = tmp[hi];
+        tmp[hi] = t;
+        lo = lo + 1;
+        hi = hi - 1;
+    }
+    MemCopy(dst, &tmp as *char8, d);
+    return d;
+}
+
+// Parses a non-negative decimal integer from a null-terminated string.
+func Atoi(s: *char8) -> int {
+    var r: int = 0;
+    var i: int = 0;
+    loop {
+        if s[i] == 0 as char8 { break; }
+        if s[i] < c8'0'[0] || s[i] > c8'9'[0] { break; }
+        r = r * 10 + (s[i] as int - 48);
+        i = i + 1;
+    }
+    return r;
+}
+
+// Returns the int value of a single hex digit, or -1 if not a hex char.
+func HexDigit(c: char8) -> int {
+    if c >= c8'0'[0] && c <= c8'9'[0] { return c as int - 48; }
+    if c >= c8'a'[0] && c <= c8'f'[0] { return c as int - 87; }
+    if c >= c8'A'[0] && c <= c8'F'[0] { return c as int - 55; }
+    return -1;
+}
+
+// URL-decodes src into dst. Returns decoded byte count (dst is NOT null-terminated).
+func UrlDecode(src: *char8, src_len: int, dst: *char8) -> int {
+    var i: int = 0;
+    var j: int = 0;
+    loop {
+        if i >= src_len { break; }
+        if src[i] == c8'%'[0] && (i + 2) < src_len {
+            let hi = HexDigit(src[i + 1]);
+            let lo = HexDigit(src[i + 2]);
+            if hi >= 0 && lo >= 0 {
+                dst[j] = (hi * 16 + lo) as char8;
+                j = j + 1;
+                i = i + 3;
+                continue;
+            }
+        }
+        if src[i] == c8'+'[0] {
+            dst[j] = c8' '[0];
+        } else {
+            dst[j] = src[i];
+        }
+        j = j + 1;
+        i = i + 1;
+    }
+    return j;
+}
+
+// Returns true if path contains a ".." component (directory traversal guard).
+func HasDotDot(path: *char8, len: int) -> bool {
+    var i: int = 0;
+    loop {
+        if i + 1 >= len { break; }
+        if path[i] == c8'.'[0] && path[i + 1] == c8'.'[0] {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Converts a network-byte-order IPv4 address to "a.b.c.d\0".
+// dst must have at least 16 bytes. Returns length written (excluding null).
+func Ipv4ToString(addr: uint32, dst: *char8) -> int {
+    // sin_addr is stored little-endian on x86: byte 0 = first octet
+    let b0 =  addr        & 0xFF;
+    let b1 = (addr >> 8)  & 0xFF;
+    let b2 = (addr >> 16) & 0xFF;
+    let b3 = (addr >> 24) & 0xFF;
+    var pos: int = 0;
+    pos = pos + Itoa(dst + pos, b0 as int);
+    dst[pos] = c8'.'[0]; pos = pos + 1;
+    pos = pos + Itoa(dst + pos, b1 as int);
+    dst[pos] = c8'.'[0]; pos = pos + 1;
+    pos = pos + Itoa(dst + pos, b2 as int);
+    dst[pos] = c8'.'[0]; pos = pos + 1;
+    pos = pos + Itoa(dst + pos, b3 as int);
+    dst[pos] = 0 as char8;
+    return pos;
+}
+
+// htons — swap byte order for a uint16.
+func htons(x: uint16) -> uint16 {
+    return ((x & 0xFF) << 8) | ((x >> 8) & 0xFF);
+}
+
+// ── Logging ───────────────────────────────────────────────────────────────────
+
+func Log(msg: *char8, len: uint64) {
+    var written: uint64 = 0;
+    let stdout = GetStdHandle(-11);
+    WriteFile(stdout, msg, len, &written, 0);
+}
+
+func LogStr(msg: *char8) {
+    let len = StrLen(msg);
+    Log(msg, len as uint64);
+}
+
+// Skips leading ASCII whitespace; returns new offset.
+func SkipWs(buf: *char8, i: int, end: int) -> int {
+    var j: int = i;
+    loop {
+        if j >= end { break; }
+        let c = buf[j];
+        if c != c8' '[0] && c != c8'\t'[0] { break; }
+        j = j + 1;
+    }
+    return j;
+}
+
+// Trims trailing ASCII whitespace from [0, len); returns new length.
+func TrimRight(buf: *char8, len: int) -> int {
+    var n: int = len;
+    loop {
+        if n == 0 { break; }
+        let c = buf[n - 1];
+        if c != c8' '[0] && c != c8'\t'[0] && c != c8'\r'[0] && c != c8'\n'[0] { break; }
+        n = n - 1;
+    }
+    return n;
+}
+
+// Copies src[0..src_len) into a null-terminated dst[0..dst_cap).
+// Truncates silently if src_len >= dst_cap.
+func CopyStr(dst: *char8, dst_cap: int, src: *char8, src_len: int) -> int {
+    var n: int = src_len;
+    if n >= dst_cap { n = dst_cap - 1; }
+    MemCopy(dst, src, n);
+    dst[n] = 0 as char8;
+    return n;
+}

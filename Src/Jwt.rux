@@ -1,0 +1,125 @@
+// Warpgate — JWT validation middleware (HS256 / HMAC-SHA256)
+//
+// Validates a compact JWT: header.payload.signature
+// All three parts are base64url-encoded (no padding).
+// The signature is HMAC-SHA256 over "header.payload" using the configured secret.
+// We validate the signature only — callers may additionally check exp etc.
+
+// Returns the integer value of a base64url character, or -1 if invalid.
+func B64UrlVal(c: char8) -> int {
+    if c >= c8'A'[0] && c <= c8'Z'[0] { return c as int - 65; }
+    if c >= c8'a'[0] && c <= c8'z'[0] { return c as int - 71; }
+    if c >= c8'0'[0] && c <= c8'9'[0] { return c as int + 4; }
+    if c == c8'-'[0] { return 62; }
+    if c == c8'_'[0] { return 63; }
+    return -1;
+}
+
+// Base64url-decode src[0..src_len) into dst[0..dst_cap).
+// Returns decoded byte count (may be less than dst_cap).
+func Base64UrlDecode(src: *char8, src_len: int, dst: *char8, dst_cap: int) -> int {
+    var i: int = 0;
+    var out: int = 0;
+    loop {
+        if i >= src_len { break; }
+
+        let c0 = src[i];
+        let c1 = if i + 1 < src_len { src[i + 1] } else { 0 as char8 };
+        let c2 = if i + 2 < src_len { src[i + 2] } else { 0 as char8 };
+        let c3 = if i + 3 < src_len { src[i + 3] } else { 0 as char8 };
+
+        let v0 = B64UrlVal(c0);
+        let v1 = B64UrlVal(c1);
+        if v0 < 0 || v1 < 0 { break; }
+
+        if out < dst_cap {
+            dst[out] = ((v0 << 2) | (v1 >> 4)) as char8;
+        }
+        out = out + 1;
+
+        let v2 = B64UrlVal(c2);
+        if v2 >= 0 && c2 != c8'='[0] {
+            if out < dst_cap {
+                dst[out] = (((v1 & 0xF) << 4) | (v2 >> 2)) as char8;
+            }
+            out = out + 1;
+
+            let v3 = B64UrlVal(c3);
+            if v3 >= 0 && c3 != c8'='[0] {
+                if out < dst_cap {
+                    dst[out] = (((v2 & 0x3) << 6) | v3) as char8;
+                }
+                out = out + 1;
+            }
+        }
+
+        i = i + 4;
+    }
+    return out;
+}
+
+// Forward declarations (defined in Http.rux, compiled before Jwt.rux)
+func GetUnixTimeSec() -> int;
+func FindJsonIntValue(json: *char8, json_len: int,
+                      key: *char8, key_len: int) -> int;
+
+// Validates a JWT token string.  Returns true if:
+//   1. The HMAC-SHA256 signature is correct, AND
+//   2. The `exp` claim (if present) has not yet passed.
+// token     — raw "header.payload.signature" string (NOT null-terminated)
+// token_len — byte count
+// secret / secret_len — HMAC key
+func JwtValidate(token: *char8, token_len: int,
+                  secret: *char8, secret_len: int) -> bool {
+    // Find the two dots separating header.payload.signature
+    var dot1: int = -1;
+    var dot2: int = -1;
+    var i: int = 0;
+    loop {
+        if i >= token_len { break; }
+        if token[i] == c8'.'[0] {
+            if dot1 < 0 { dot1 = i; }
+            else        { dot2 = i; break; }
+        }
+        i = i + 1;
+    }
+    if dot1 < 0 || dot2 < 0 { return false; }
+
+    let sig_start = dot2 + 1;
+    let sig_len   = token_len - sig_start;
+    if sig_len <= 0 { return false; }
+
+    // Decode the base64url signature
+    var sig_decoded: [char8; 64] = [0; 64];
+    let decoded_len = Base64UrlDecode(token + sig_start, sig_len,
+                                       &sig_decoded as *char8, 64);
+    if decoded_len != SHA256_HASH_BYTES { return false; }
+
+    // Compute expected HMAC-SHA256("header.payload", secret)
+    var expected: [char8; 32] = [0; 32];
+    if !HmacSha256(secret, secret_len, token, dot2, &expected as *char8) {
+        return false;
+    }
+
+    if !ConstantTimeEq(&sig_decoded as *char8, &expected as *char8, SHA256_HASH_BYTES) {
+        return false;
+    }
+
+    // ── exp (expiry) claim check ──────────────────────────────────────────────
+    // Decode the payload to check for an exp claim.
+    var payload: [char8; 1024] = [0; 1024];
+    let payload_len = Base64UrlDecode(token + dot1 + 1, dot2 - dot1 - 1,
+                                       &payload as *char8, 1024);
+    if payload_len > 0 {
+        let exp = FindJsonIntValue(&payload as *char8, payload_len,
+                                   c8"exp".data, 3);
+        if exp > 0 {
+            let now = GetUnixTimeSec();
+            if now > exp { return false; }
+        }
+    }
+
+    return true;
+}
+
+// JwtCheck is defined in Router.rux (after ServerCtx and Config are available).

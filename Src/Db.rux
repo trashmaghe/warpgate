@@ -1,0 +1,227 @@
+// Warpgate — SQLite3 wrapper
+//
+// Thin, safe wrapper over sqlite3.dll providing:
+//   - Db (handle + mutex)
+//   - DbOpen / DbClose
+//   - DbExec   (fire-and-forget DDL / DML with no result rows)
+//   - DbQuery  (SELECT → rows as JSON array)
+//   - DbInsert (INSERT and return last_insert_rowid)
+//
+// All public functions are thread-safe: a CRITICAL_SECTION serialises access
+// so multiple workers can share a single Db handle without data races.
+// SQLite3 supports WAL mode for concurrent reads, but serializing here keeps
+// the wrapper simple.
+
+struct Db {
+    handle: int,
+    lock:   [uint8; 40],   // CRITICAL_SECTION
+    open:   bool,
+}
+
+func DbOpen(path: *char8, db: *Db) -> bool {
+    db.open   = false;
+    db.handle = 0;
+    InitializeCriticalSection(&db.lock as *opaque);
+
+    if sqlite3_open(path, &db.handle) != SQLITE_OK {
+        LogStr(c8"[db] sqlite3_open failed\n".data);
+        return false;
+    }
+
+    // Enable WAL for better concurrent read performance.
+    sqlite3_exec(db.handle, c8"PRAGMA journal_mode=WAL;".data,
+                 0 as *opaque, 0 as *opaque, 0 as *opaque);
+
+    // Busy timeout: 5 seconds before returning SQLITE_BUSY.
+    sqlite3_exec(db.handle, c8"PRAGMA busy_timeout=5000;".data,
+                 0 as *opaque, 0 as *opaque, 0 as *opaque);
+
+    db.open = true;
+    return true;
+}
+
+func DbClose(db: *Db) {
+    if db.open {
+        sqlite3_close(db.handle);
+        db.open   = false;
+        db.handle = 0;
+    }
+    DeleteCriticalSection(&db.lock as *opaque);
+}
+
+// ── DbExec — run a single SQL statement with no output ───────────────────────
+
+func DbExec(db: *Db, sql: *char8) -> bool {
+    if !db.open { return false; }
+    EnterCriticalSection(&db.lock as *opaque);
+    let rc = sqlite3_exec(db.handle, sql,
+                          0 as *opaque, 0 as *opaque, 0 as *opaque);
+    LeaveCriticalSection(&db.lock as *opaque);
+    return rc == SQLITE_OK;
+}
+
+// ── DbQuery — SELECT → JSON array string ─────────────────────────────────────
+//
+// Runs sql, serialises all result rows as a JSON array into out[0..out_cap).
+// Returns byte count written.  Each row is an object with column names as keys.
+// Example output: [{"id":1,"name":"Alice"},{"id":2,"name":"Bob"}]
+
+func DbQuery(db: *Db, sql: *char8, out: *char8, out_cap: int) -> int {
+    if !db.open { return 0; }
+
+    EnterCriticalSection(&db.lock as *opaque);
+
+    var stmt: int = 0;
+    let prep_rc = sqlite3_prepare_v2(db.handle, sql, -1, &stmt, 0 as *opaque);
+    if prep_rc != SQLITE_OK {
+        LeaveCriticalSection(&db.lock as *opaque);
+        return 0;
+    }
+
+    let col_count = sqlite3_column_count(stmt);
+    var p: int = 0;
+
+    out[p] = c8'['[0]; p = p + 1;
+    var first_row: bool = true;
+
+    loop {
+        let step = sqlite3_step(stmt);
+        if step != SQLITE_ROW { break; }
+
+        if !first_row { out[p] = c8','[0]; p = p + 1; }
+        first_row = false;
+        out[p] = c8'{'[0]; p = p + 1;
+
+        var ci: int = 0;
+        loop {
+            if ci >= col_count { break; }
+
+            if ci > 0 { out[p] = c8','[0]; p = p + 1; }
+
+            // Column name
+            let col_name = sqlite3_column_name(stmt, ci);
+            out[p] = c8'"'[0]; p = p + 1;
+            if col_name != 0 as *char8 {
+                let nl = StrLen(col_name);
+                var k: int = 0;
+                loop {
+                    if k >= nl || p >= out_cap - 4 { break; }
+                    let c = col_name[k];
+                    // Escape double-quote and backslash
+                    if c == c8'"'[0]  { out[p] = c8'\\'[0]; p = p + 1; }
+                    if c == c8'\\'[0] { out[p] = c8'\\'[0]; p = p + 1; }
+                    out[p] = c; p = p + 1;
+                    k = k + 1;
+                }
+            }
+            out[p] = c8'"'[0]; p = p + 1;
+            out[p] = c8':'[0]; p = p + 1;
+
+            // Column value
+            let col_type = sqlite3_column_type(stmt, ci);
+            if col_type == SQLITE_INTEGER {
+                let v = sqlite3_column_int64(stmt, ci);
+                p = p + Itoa(out + p, v);
+            } else if col_type == SQLITE_FLOAT {
+                // Simplified: just emit the integer part for now
+                let v = sqlite3_column_int64(stmt, ci);
+                p = p + Itoa(out + p, v);
+            } else if col_type == SQLITE_NULL {
+                MemCopy(out + p, c8"null".data, 4); p = p + 4;
+            } else {
+                // TEXT or BLOB: emit as JSON string
+                let text = sqlite3_column_text(stmt, ci);
+                out[p] = c8'"'[0]; p = p + 1;
+                if text != 0 as *char8 {
+                    let tl = StrLen(text);
+                    var ti: int = 0;
+                    loop {
+                        if ti >= tl || p >= out_cap - 4 { break; }
+                        let c = text[ti];
+                        if c == c8'"'[0]  { out[p] = c8'\\'[0]; p = p + 1; }
+                        if c == c8'\\'[0] { out[p] = c8'\\'[0]; p = p + 1; }
+                        if c == c8'\n'[0] {
+                            out[p] = c8'\\'[0]; p = p + 1;
+                            out[p] = c8'n'[0];  p = p + 1;
+                            ti = ti + 1;
+                            continue;
+                        }
+                        out[p] = c; p = p + 1;
+                        ti = ti + 1;
+                    }
+                }
+                out[p] = c8'"'[0]; p = p + 1;
+            }
+
+            ci = ci + 1;
+        }
+
+        out[p] = c8'}'[0]; p = p + 1;
+
+        if p >= out_cap - 16 { break; }  // safety margin
+    }
+
+    sqlite3_finalize(stmt);
+    LeaveCriticalSection(&db.lock as *opaque);
+
+    out[p] = c8']'[0]; p = p + 1;
+    out[p] = 0 as char8;
+    return p;
+}
+
+// ── DbInsert — INSERT and return row ID ───────────────────────────────────────
+
+// Prepares and steps a single INSERT statement with no bind parameters.
+// Returns last_insert_rowid on success, -1 on error.
+func DbInsert(db: *Db, sql: *char8) -> int {
+    if !db.open { return -1; }
+    EnterCriticalSection(&db.lock as *opaque);
+
+    var stmt: int = 0;
+    let prep_rc = sqlite3_prepare_v2(db.handle, sql, -1, &stmt, 0 as *opaque);
+    if prep_rc != SQLITE_OK {
+        LeaveCriticalSection(&db.lock as *opaque);
+        return -1;
+    }
+
+    let step_rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    var row_id: int = -1;
+    if step_rc == SQLITE_DONE {
+        row_id = sqlite3_last_insert_rowid(db.handle);
+    }
+
+    LeaveCriticalSection(&db.lock as *opaque);
+    return row_id;
+}
+
+// ── DbPrepareAndBind helpers ──────────────────────────────────────────────────
+//
+// For parameterised queries.  Caller calls DbPrepare, DbBindText/Int, DbStep
+// in a loop, then DbFinalise.  Not thread-safe on the statement handle —
+// caller must serialise if needed, or use DbExec/DbQuery for simple cases.
+
+func DbPrepare(db: *Db, sql: *char8) -> int {
+    if !db.open { return 0; }
+    var stmt: int = 0;
+    sqlite3_prepare_v2(db.handle, sql, -1, &stmt, 0 as *opaque);
+    return stmt;
+}
+
+func DbBindText(stmt: int, idx: int, text: *char8) {
+    let len = StrLen(text);
+    sqlite3_bind_text(stmt, idx, text, len, SQLITE_TRANSIENT as *opaque);
+}
+
+func DbBindInt(stmt: int, idx: int, val: int) {
+    sqlite3_bind_int64(stmt, idx, val);
+}
+
+func DbStep(stmt: int) -> int {
+    return sqlite3_step(stmt);
+}
+
+func DbFinalise(stmt: int) {
+    sqlite3_finalize(stmt);
+}

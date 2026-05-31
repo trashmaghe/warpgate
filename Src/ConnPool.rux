@@ -1,0 +1,168 @@
+// Warpgate — Upstream TCP connection pool
+//
+// Slots are now tagged with an upstream index so a single pool serves all
+// upstreams in the UpstreamPool.  A slot with up_idx == -1 is unbound and
+// will be connected to whichever upstream claims it.
+
+struct ConnSlot {
+    sock:    int,
+    in_use:  bool,
+    healthy: bool,
+    up_idx:  int,    // -1 = unbound
+}
+
+struct ConnPool {
+    slots: [ConnSlot; 32],
+    lock:  [uint8; 40],
+    size:  int,
+}
+
+func InitConnPool(pool: *ConnPool, size: int) {
+    let cap = if size > CONN_POOL_SIZE { CONN_POOL_SIZE } else { size };
+    pool.size = cap;
+    InitializeCriticalSection(&pool.lock as *opaque);
+    var i: int = 0;
+    loop {
+        if i >= cap { break; }
+        pool.slots[i].sock    = INVALID_SOCKET;
+        pool.slots[i].in_use  = false;
+        pool.slots[i].healthy = false;
+        pool.slots[i].up_idx  = -1;
+        i = i + 1;
+    }
+}
+
+// Opens a fresh TCP connection to the given UpstreamDef.
+func ConnectToUpstream(up: *UpstreamDef) -> int {
+    var host_buf: [char8; 65] = [0; 65];
+    MemCopy(&host_buf as *char8, &up.host as *char8, up.host_len);
+    host_buf[up.host_len] = 0 as char8;
+
+    let ip = ResolveHost(&host_buf as *char8);
+    if ip == INADDR_NONE { return INVALID_SOCKET; }
+
+    let sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if sock == INVALID_SOCKET { return INVALID_SOCKET; }
+
+    var ms: uint32 = UPSTREAM_TIMEOUT_MS;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &ms as *char8, 4);
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &ms as *char8, 4);
+
+    var addr: SockAddrIn = SockAddrIn {
+        sin_family: AF_INET as uint16,
+        sin_port:   htons(up.port),
+        sin_addr:   ip,
+        sin_zero:   [0; 8],
+    };
+
+    if connect(sock, &addr as *opaque, 16) != 0 {
+        closesocket(sock);
+        return INVALID_SOCKET;
+    }
+    return sock;
+}
+
+// Acquires a slot bound to up_idx, reconnecting if necessary.
+// Returns INVALID_SOCKET if all slots are in-use.
+func AcquireConn(pool: *ConnPool, up_idx: int, up: *UpstreamDef) -> int {
+    EnterCriticalSection(&pool.lock as *opaque);
+
+    // Prefer: same up_idx, !in_use, healthy — reuse existing socket
+    var reuse: int = -1;
+    var empty: int = -1;
+    var i: int = 0;
+    loop {
+        if i >= pool.size { break; }
+        let s = &pool.slots[i] as *ConnSlot;
+        if !s.in_use {
+            if s.up_idx == up_idx && s.healthy && s.sock != INVALID_SOCKET {
+                reuse = i; break;
+            }
+            if s.up_idx == -1 && empty < 0 { empty = i; }
+            if s.up_idx == up_idx && empty < 0 { empty = i; }
+        }
+        i = i + 1;
+    }
+
+    let found = if reuse >= 0 { reuse } else { empty };
+    if found < 0 {
+        LeaveCriticalSection(&pool.lock as *opaque);
+        return INVALID_SOCKET;
+    }
+
+    let slot = &pool.slots[found] as *ConnSlot;
+    slot.in_use = true;
+    let prev_sock    = slot.sock;
+    let prev_healthy = slot.healthy && slot.up_idx == up_idx;
+    LeaveCriticalSection(&pool.lock as *opaque);
+
+    if prev_healthy && prev_sock != INVALID_SOCKET { return prev_sock; }
+
+    if prev_sock != INVALID_SOCKET { closesocket(prev_sock); }
+
+    let new_sock = ConnectToUpstream(up);
+
+    EnterCriticalSection(&pool.lock as *opaque);
+    let s2 = &pool.slots[found] as *ConnSlot;
+    s2.up_idx = up_idx;
+    if new_sock == INVALID_SOCKET {
+        s2.sock    = INVALID_SOCKET;
+        s2.healthy = false;
+        s2.in_use  = false;
+    } else {
+        s2.sock    = new_sock;
+        s2.healthy = true;
+    }
+    LeaveCriticalSection(&pool.lock as *opaque);
+
+    return new_sock;
+}
+
+// Tries to insert a live socket into the pool (e.g. after an ephemeral request
+// that ended with upstream keep-alive).  Returns true if a slot was claimed.
+func TryInsertConn(pool: *ConnPool, sock: int, up_idx: int) -> bool {
+    EnterCriticalSection(&pool.lock as *opaque);
+    var i: int = 0;
+    var inserted: bool = false;
+    loop {
+        if i >= pool.size { break; }
+        let s = &pool.slots[i] as *ConnSlot;
+        if !s.in_use && (s.up_idx == -1 || (s.up_idx == up_idx && !s.healthy)) {
+            // Close any old dead socket in this slot
+            if s.sock != INVALID_SOCKET && s.sock != sock { closesocket(s.sock); }
+            s.sock    = sock;
+            s.up_idx  = up_idx;
+            s.healthy = true;
+            s.in_use  = false;
+            inserted  = true;
+            break;
+        }
+        i = i + 1;
+    }
+    LeaveCriticalSection(&pool.lock as *opaque);
+    return inserted;
+}
+
+func ReleaseConn(pool: *ConnPool, sock: int, ok: bool) {
+    EnterCriticalSection(&pool.lock as *opaque);
+    var i: int = 0;
+    loop {
+        if i >= pool.size { break; }
+        let s = &pool.slots[i] as *ConnSlot;
+        if s.sock == sock {
+            s.in_use = false;
+            if ok {
+                s.healthy = true;
+            } else {
+                s.healthy = false;
+                s.sock    = INVALID_SOCKET;
+                LeaveCriticalSection(&pool.lock as *opaque);
+                closesocket(sock);
+                return;
+            }
+            break;
+        }
+        i = i + 1;
+    }
+    LeaveCriticalSection(&pool.lock as *opaque);
+}

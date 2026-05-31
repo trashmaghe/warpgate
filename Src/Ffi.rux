@@ -1,0 +1,702 @@
+// Warpgate — FFI declarations and compile-time constants
+
+// ── Winsock2 ──────────────────────────────────────────────────────────────────
+
+@[Import(lib: "ws2_32")]
+extern func WSAStartup(version: uint16, data: *opaque) -> int;
+
+@[Import(lib: "ws2_32")]
+extern func WSACleanup() -> int;
+
+@[Import(lib: "ws2_32")]
+extern func socket(af: int, sock_type: int, protocol: int) -> int;
+
+// WSASocket with flags (e.g. WSA_FLAG_OVERLAPPED for IOCP)
+@[Import(lib: "ws2_32")]
+extern func WSASocket(af: int, sock_type: int, protocol: int,
+                      proto_info: *opaque, group: uint32, flags: uint32) -> int;
+
+@[Import(lib: "ws2_32")]
+extern func bind(sock: int, addr: *opaque, addrlen: int) -> int;
+
+@[Import(lib: "ws2_32")]
+extern func listen(sock: int, backlog: int) -> int;
+
+@[Import(lib: "ws2_32")]
+extern func accept(sock: int, addr: *opaque, addrlen: *int) -> int;
+
+@[Import(lib: "ws2_32")]
+extern func connect(sock: int, addr: *opaque, addrlen: int) -> int;
+
+@[Import(lib: "ws2_32")]
+extern func recv(sock: int, buf: *char8, len: int, flags: int) -> int;
+
+@[Import(lib: "ws2_32")]
+extern func send(sock: int, buf: *char8, len: int, flags: int) -> int;
+
+@[Import(lib: "ws2_32")]
+extern func closesocket(sock: int) -> int;
+
+@[Import(lib: "ws2_32")]
+extern func setsockopt(sock: int, level: int, optname: int,
+                       optval: *char8, optlen: int) -> int;
+
+@[Import(lib: "ws2_32")]
+extern func inet_addr(cp: *char8) -> uint32;
+
+@[Import(lib: "ws2_32")]
+extern func getaddrinfo(node: *char8, service: *char8,
+                        hints: *opaque, result: *opaque) -> int;
+
+@[Import(lib: "ws2_32")]
+extern func freeaddrinfo(ai: *opaque);
+
+// Overlapped I/O
+@[Import(lib: "ws2_32")]
+extern func WSARecv(sock: int, buffers: *opaque, buf_count: uint32,
+                    bytes_recv: *uint32, flags: *uint32,
+                    overlapped: *opaque, completion: *opaque) -> int;
+
+@[Import(lib: "ws2_32")]
+extern func WSASend(sock: int, buffers: *opaque, buf_count: uint32,
+                    bytes_sent: *uint32, flags: uint32,
+                    overlapped: *opaque, completion: *opaque) -> int;
+
+@[Import(lib: "ws2_32")]
+extern func WSAGetLastError() -> int;
+
+// select for readiness polling (e.g. WebSocket bidirectional relay)
+@[Import(lib: "ws2_32")]
+extern func select(nfds: int, readfds: *opaque, writefds: *opaque,
+                   exceptfds: *opaque, timeout: *opaque) -> int;
+
+// ioctlsocket — set socket mode (e.g. FIONBIO for non-blocking)
+@[Import(lib: "ws2_32")]
+extern func ioctlsocket(sock: int, cmd: int, argp: *uint32) -> int;
+
+// ── Mswsock — AcceptEx ────────────────────────────────────────────────────────
+
+@[Import(lib: "mswsock")]
+extern func AcceptEx(listen_sock: int, accept_sock: int,
+                     output_buf: *char8, recv_data_len: uint32,
+                     local_addr_len: uint32, remote_addr_len: uint32,
+                     bytes_recv: *uint32, overlapped: *opaque) -> bool;
+
+@[Import(lib: "mswsock")]
+extern func GetAcceptExSockaddrs(output_buf: *char8, recv_data_len: uint32,
+                                  local_addr_len: uint32, remote_addr_len: uint32,
+                                  local_sockaddr: *opaque, local_len: *int,
+                                  remote_sockaddr: *opaque, remote_len: *int);
+
+// ── Kernel32 — I/O ────────────────────────────────────────────────────────────
+
+@[Import(lib: "kernel32")]
+extern func GetStdHandle(nStdHandle: int) -> int;
+
+@[Import(lib: "kernel32")]
+extern func WriteFile(handle: int, buf: *char8, count: uint64,
+                      written: *uint64, overlapped: int) -> bool;
+
+@[Import(lib: "kernel32")]
+extern func CreateFileA(path: *char8, access: uint32, share: uint32,
+                        security: *opaque, disposition: uint32,
+                        flags: uint32, templ: int) -> int;
+
+@[Import(lib: "kernel32")]
+extern func ReadFile(handle: int, buf: *char8, to_read: uint32,
+                     bytes_read: *uint32, overlapped: *opaque) -> bool;
+
+@[Import(lib: "kernel32")]
+extern func GetFileSizeEx(handle: int, size: *int64) -> bool;
+
+@[Import(lib: "kernel32")]
+extern func GetFileTime(handle: int, created: *opaque,
+                        accessed: *opaque, written: *opaque) -> bool;
+
+@[Import(lib: "kernel32")]
+extern func CloseHandle(handle: int) -> bool;
+
+@[Import(lib: "kernel32")]
+extern func GetLastError() -> uint32;
+
+// ── Kernel32 — IOCP ───────────────────────────────────────────────────────────
+
+// Pass INVALID_HANDLE_VALUE / 0 as existing_port to create a new IOCP.
+@[Import(lib: "kernel32")]
+extern func CreateIoCompletionPort(handle: int, existing_port: int,
+                                    completion_key: int, num_threads: uint32) -> int;
+
+// lpOverlapped receives a pointer to the OVERLAPPED that completed.
+@[Import(lib: "kernel32")]
+extern func GetQueuedCompletionStatus(port: int, bytes: *uint32, key: *int,
+                                       overlapped: *opaque, timeout: uint32) -> bool;
+
+@[Import(lib: "kernel32")]
+extern func PostQueuedCompletionStatus(port: int, bytes: uint32, key: int,
+                                        overlapped: *opaque) -> bool;
+
+// ── Kernel32 — Memory ─────────────────────────────────────────────────────────
+
+@[Import(lib: "kernel32")]
+extern func GetProcessHeap() -> int;
+
+@[Import(lib: "kernel32")]
+extern func HeapAlloc(heap: int, flags: uint32, bytes: uint64) -> *opaque;
+
+@[Import(lib: "kernel32")]
+extern func HeapFree(heap: int, flags: uint32, ptr: *opaque) -> bool;
+
+// ── Kernel32 — Threading ──────────────────────────────────────────────────────
+
+@[Import(lib: "kernel32")]
+extern func CreateThread(security: *opaque, stack_size: uint64,
+                         start: *opaque, param: *opaque,
+                         flags: uint32, id: *uint32) -> int;
+
+@[Import(lib: "kernel32")]
+extern func Sleep(ms: uint32);
+
+@[Import(lib: "kernel32")]
+extern func InitializeCriticalSection(cs: *opaque);
+
+@[Import(lib: "kernel32")]
+extern func DeleteCriticalSection(cs: *opaque);
+
+@[Import(lib: "kernel32")]
+extern func EnterCriticalSection(cs: *opaque);
+
+@[Import(lib: "kernel32")]
+extern func LeaveCriticalSection(cs: *opaque);
+
+@[Import(lib: "kernel32")]
+extern func CreateSemaphoreA(security: *opaque, initial: int,
+                              maximum: int, name: *char8) -> int;
+
+@[Import(lib: "kernel32")]
+extern func ReleaseSemaphore(sem: int, count: int, prev: *int) -> bool;
+
+@[Import(lib: "kernel32")]
+extern func WaitForSingleObject(handle: int, ms: uint32) -> uint32;
+
+@[Import(lib: "kernel32")]
+extern func InterlockedAdd64(addend: *opaque, value: int) -> int;
+
+// ── Kernel32 — Time ───────────────────────────────────────────────────────────
+
+// GetTickCount64 — milliseconds since system boot (for rate limiting)
+@[Import(lib: "kernel32")]
+extern func GetTickCount64() -> int;
+
+// GetSystemTimeAsFileTime — FILETIME (100-ns intervals since 1601-01-01) for JWT exp
+@[Import(lib: "kernel32")]
+extern func GetSystemTimeAsFileTime(systime: *opaque);
+
+@[Import(lib: "kernel32")]
+extern func GetLocalTime(st: *opaque);
+
+@[Import(lib: "kernel32")]
+extern func QueryPerformanceCounter(count: *opaque) -> bool;
+
+@[Import(lib: "kernel32")]
+extern func QueryPerformanceFrequency(freq: *opaque) -> bool;
+
+// ── Kernel32 — Process ────────────────────────────────────────────────────────
+
+@[Import(lib: "kernel32")]
+extern func ExitProcess(code: uint32);
+
+@[Import(lib: "kernel32")]
+extern func SetConsoleCtrlHandler(handler: *opaque, add: bool) -> bool;
+
+// Environment variable access — used to publish the control block address to CtrlHandler
+@[Import(lib: "kernel32")]
+extern func SetEnvironmentVariableA(name: *char8, value: *char8) -> bool;
+
+@[Import(lib: "kernel32")]
+extern func GetEnvironmentVariableA(name: *char8, buf: *char8,
+                                     size: uint32, written: *uint32) -> uint32;
+
+// ── HTTP.sys (httpapi.dll) ────────────────────────────────────────────────────
+
+// Version passed as uint32: low USHORT = major, high USHORT = minor.
+// HTTP API v2.0 = 0x00000002
+@[Import(lib: "httpapi")]
+extern func HttpInitialize(version: uint32, flags: uint32,
+                           reserved: *opaque) -> uint32;
+
+@[Import(lib: "httpapi")]
+extern func HttpTerminate(flags: uint32, reserved: *opaque) -> uint32;
+
+// Name and SecurityAttributes may be null (0).
+@[Import(lib: "httpapi")]
+extern func HttpCreateRequestQueue(version: uint32, name: *opaque,
+                                    security: *opaque, flags: uint32,
+                                    handle: *int) -> uint32;
+
+@[Import(lib: "httpapi")]
+extern func HttpCloseRequestQueue(handle: int) -> uint32;
+
+// FullyQualifiedUrl is a wide (UTF-16) string.
+@[Import(lib: "httpapi")]
+extern func HttpAddUrl(handle: int, url: *char8,
+                       reserved: *opaque) -> uint32;
+
+@[Import(lib: "httpapi")]
+extern func HttpRemoveUrl(handle: int, url: *char8) -> uint32;
+
+// Blocking receive — fills pRequestBuffer.
+@[Import(lib: "httpapi")]
+extern func HttpReceiveHttpRequest(handle: int, request_id: int,
+                                    flags: uint32, buf: *char8,
+                                    buf_len: uint32, bytes_recv: *uint32,
+                                    overlapped: *opaque) -> uint32;
+
+// pResponse is *HTTP_RESPONSE — passed as *opaque.
+@[Import(lib: "httpapi")]
+extern func HttpSendHttpResponse(handle: int, request_id: int,
+                                  flags: uint32, response: *opaque,
+                                  cache: *opaque, bytes_sent: *uint32,
+                                  reserved1: *opaque, reserved2: uint32,
+                                  overlapped: *opaque,
+                                  log_data: *opaque) -> uint32;
+
+// ── Zlib (zlib1.dll) ──────────────────────────────────────────────────────────
+
+// Macro-expanded name; pass ZLIB_VERSION string + sizeof(z_stream).
+@[Import(lib: "zlib1")]
+extern func deflateInit2_(strm: *opaque, level: int, method: int,
+                          window_bits: int, mem_level: int, strategy: int,
+                          version: *char8, stream_size: int) -> int;
+
+@[Import(lib: "zlib1")]
+extern func deflate(strm: *opaque, flush: int) -> int;
+
+@[Import(lib: "zlib1")]
+extern func deflateEnd(strm: *opaque) -> int;
+
+@[Import(lib: "zlib1")]
+extern func inflateInit_(strm: *opaque, version: *char8,
+                         stream_size: int) -> int;
+
+@[Import(lib: "zlib1")]
+extern func inflate(strm: *opaque, flush: int) -> int;
+
+@[Import(lib: "zlib1")]
+extern func inflateEnd(strm: *opaque) -> int;
+
+// ── BCrypt (bcrypt.dll) ───────────────────────────────────────────────────────
+
+// pszAlgId and pszImplementation are wide strings (*char8 = UTF-16LE buffer).
+@[Import(lib: "bcrypt")]
+extern func BCryptOpenAlgorithmProvider(ph_alg: *int, psz_alg_id: *char8,
+                                         psz_impl: *char8, flags: uint32) -> int;
+
+@[Import(lib: "bcrypt")]
+extern func BCryptCloseAlgorithmProvider(h_alg: int, flags: uint32) -> int;
+
+@[Import(lib: "bcrypt")]
+extern func BCryptGetProperty(h_obj: int, psz_prop: *char8,
+                               pb_out: *char8, cb_out: uint32,
+                               pcb_result: *uint32, flags: uint32) -> int;
+
+@[Import(lib: "bcrypt")]
+extern func BCryptCreateHash(h_alg: int, ph_hash: *int,
+                              pb_hash_obj: *char8, cb_hash_obj: uint32,
+                              pb_secret: *char8, cb_secret: uint32,
+                              flags: uint32) -> int;
+
+@[Import(lib: "bcrypt")]
+extern func BCryptHashData(h_hash: int, pb_input: *char8,
+                            cb_input: uint32, flags: uint32) -> int;
+
+@[Import(lib: "bcrypt")]
+extern func BCryptFinishHash(h_hash: int, pb_output: *char8,
+                              cb_output: uint32, flags: uint32) -> int;
+
+@[Import(lib: "bcrypt")]
+extern func BCryptDestroyHash(h_hash: int) -> int;
+
+// ── WinHTTP (winhttp.dll) ─────────────────────────────────────────────────────
+
+// pszAgentW is a wide string.
+@[Import(lib: "winhttp")]
+extern func WinHttpOpen(agent: *char8, access_type: uint32,
+                        proxy: *opaque, bypass: *opaque,
+                        flags: uint32) -> int;
+
+@[Import(lib: "winhttp")]
+extern func WinHttpConnect(session: int, server: *char8,
+                            port: uint16, reserved: uint32) -> int;
+
+@[Import(lib: "winhttp")]
+extern func WinHttpOpenRequest(connect: int, verb: *char8,
+                                object_name: *char8, version: *opaque,
+                                referrer: *opaque, accept_types: *opaque,
+                                flags: uint32) -> int;
+
+@[Import(lib: "winhttp")]
+extern func WinHttpAddRequestHeaders(req: int, headers: *char8,
+                                      headers_len: uint32, modifiers: uint32) -> bool;
+
+@[Import(lib: "winhttp")]
+extern func WinHttpSendRequest(req: int, headers: *opaque,
+                                headers_len: uint32, optional: *opaque,
+                                optional_len: uint32, total_len: uint32,
+                                context: int) -> bool;
+
+@[Import(lib: "winhttp")]
+extern func WinHttpReceiveResponse(req: int, reserved: *opaque) -> bool;
+
+@[Import(lib: "winhttp")]
+extern func WinHttpReadData(req: int, buf: *char8,
+                             to_read: uint32, bytes_read: *uint32) -> bool;
+
+@[Import(lib: "winhttp")]
+extern func WinHttpQueryDataAvailable(req: int, bytes_avail: *uint32) -> bool;
+
+@[Import(lib: "winhttp")]
+extern func WinHttpCloseHandle(handle: int) -> bool;
+
+// ── SQLite3 (sqlite3.dll) ─────────────────────────────────────────────────────
+
+@[Import(lib: "sqlite3")]
+extern func sqlite3_open(filename: *char8, ppDb: *int) -> int;
+
+@[Import(lib: "sqlite3")]
+extern func sqlite3_close(db: int) -> int;
+
+@[Import(lib: "sqlite3")]
+extern func sqlite3_exec(db: int, sql: *char8, callback: *opaque,
+                          arg: *opaque, errmsg: *opaque) -> int;
+
+@[Import(lib: "sqlite3")]
+extern func sqlite3_prepare_v2(db: int, sql: *char8, n_byte: int,
+                                pp_stmt: *int, pz_tail: *opaque) -> int;
+
+@[Import(lib: "sqlite3")]
+extern func sqlite3_step(stmt: int) -> int;
+
+@[Import(lib: "sqlite3")]
+extern func sqlite3_finalize(stmt: int) -> int;
+
+@[Import(lib: "sqlite3")]
+extern func sqlite3_reset(stmt: int) -> int;
+
+@[Import(lib: "sqlite3")]
+extern func sqlite3_column_count(stmt: int) -> int;
+
+@[Import(lib: "sqlite3")]
+extern func sqlite3_column_name(stmt: int, col: int) -> *char8;
+
+@[Import(lib: "sqlite3")]
+extern func sqlite3_column_text(stmt: int, col: int) -> *char8;
+
+@[Import(lib: "sqlite3")]
+extern func sqlite3_column_int(stmt: int, col: int) -> int;
+
+@[Import(lib: "sqlite3")]
+extern func sqlite3_column_int64(stmt: int, col: int) -> int;
+
+@[Import(lib: "sqlite3")]
+extern func sqlite3_column_double(stmt: int, col: int) -> float64;
+
+@[Import(lib: "sqlite3")]
+extern func sqlite3_column_type(stmt: int, col: int) -> int;
+
+@[Import(lib: "sqlite3")]
+extern func sqlite3_bind_text(stmt: int, idx: int, text: *char8,
+                               n: int, destructor: *opaque) -> int;
+
+@[Import(lib: "sqlite3")]
+extern func sqlite3_bind_int(stmt: int, idx: int, val: int) -> int;
+
+@[Import(lib: "sqlite3")]
+extern func sqlite3_bind_int64(stmt: int, idx: int, val: int) -> int;
+
+@[Import(lib: "sqlite3")]
+extern func sqlite3_bind_null(stmt: int, idx: int) -> int;
+
+@[Import(lib: "sqlite3")]
+extern func sqlite3_errmsg(db: int) -> *char8;
+
+@[Import(lib: "sqlite3")]
+extern func sqlite3_last_insert_rowid(db: int) -> int;
+
+@[Import(lib: "sqlite3")]
+extern func sqlite3_changes(db: int) -> int;
+
+// ── Secur32 — SChannel ───────────────────────────────────────────────────────
+
+@[Import(lib: "secur32")]
+extern func AcquireCredentialsHandleA(
+    principal: *char8, package: *char8, cred_use: uint32,
+    logon_id: *opaque, auth_data: *opaque,
+    get_key_fn: *opaque, get_key_arg: *opaque,
+    cred_handle: *opaque, expiry: *opaque) -> int;
+
+@[Import(lib: "secur32")]
+extern func InitializeSecurityContextA(
+    cred: *opaque, ctx: *opaque, target: *char8,
+    flags: uint32, reserved1: uint32, data_rep: uint32,
+    input: *opaque, reserved2: uint32,
+    new_ctx: *opaque, output: *opaque,
+    attrs: *uint32, expiry: *opaque) -> int;
+
+@[Import(lib: "secur32")]
+extern func DeleteSecurityContext(ctx: *opaque) -> int;
+
+@[Import(lib: "secur32")]
+extern func FreeCredentialsHandle(cred: *opaque) -> int;
+
+@[Import(lib: "secur32")]
+extern func EncryptMessage(ctx: *opaque, qop: uint32,
+                           msg: *opaque, seq: uint32) -> int;
+
+@[Import(lib: "secur32")]
+extern func DecryptMessage(ctx: *opaque, msg: *opaque,
+                           seq: uint32, qop: *uint32) -> int;
+
+@[Import(lib: "secur32")]
+extern func QueryContextAttributesA(ctx: *opaque, attr: uint32,
+                                    buf: *opaque) -> int;
+
+@[Import(lib: "secur32")]
+extern func FreeContextBuffer(buf: *opaque) -> int;
+
+// Server-side SChannel handshake
+@[Import(lib: "secur32")]
+extern func AcceptSecurityContext(
+    cred: *opaque, ctx: *opaque, input: *opaque,
+    flags: uint32, data_rep: uint32,
+    new_ctx: *opaque, output: *opaque,
+    attrs: *uint32, expiry: *opaque) -> int;
+
+// ── Crypt32 — PKCS#12 certificate import ─────────────────────────────────────
+
+// pfx is a pointer to a CRYPT_DATA_BLOB { DWORD cbData; BYTE *pbData; } = 16 bytes on x64.
+// password is a UTF-16LE null-terminated wide string.
+@[Import(lib: "crypt32")]
+extern func PFXImportCertStore(pfx: *opaque, password: *char8,
+                                flags: uint32) -> int;
+
+// Find the first certificate in the store (CERT_FIND_ANY = 0).
+@[Import(lib: "crypt32")]
+extern func CertFindCertificateInStore(
+    cert_store: int, encoding: uint32,
+    find_flags: uint32, find_type: uint32,
+    find_para: *opaque, prev_cert: *opaque) -> *opaque;
+
+@[Import(lib: "crypt32")]
+extern func CertCloseStore(cert_store: int, flags: uint32) -> bool;
+
+@[Import(lib: "crypt32")]
+extern func CertFreeCertificateContext(cert_context: *opaque) -> bool;
+
+// ── Network structures ────────────────────────────────────────────────────────
+
+struct SockAddrIn {
+    sin_family: uint16,
+    sin_port:   uint16,
+    sin_addr:   uint32,
+    sin_zero:   [uint8; 8],
+}
+
+// ── Socket constants ──────────────────────────────────────────────────────────
+
+const AF_INET: int                   = 2;
+const SOCK_STREAM: int               = 1;
+const IPPROTO_TCP: int               = 6;
+const INVALID_SOCKET: int            = -1;
+const SOL_SOCKET: int                = 0xFFFF;
+const SO_RCVTIMEO: int               = 0x1006;
+const SO_SNDTIMEO: int               = 0x1005;
+const SO_REUSEADDR: int              = 0x0004;
+const SO_UPDATE_ACCEPT_CONTEXT: int  = 0x700B;
+const INADDR_NONE: uint32            = 0xFFFFFFFF;
+const WSA_FLAG_OVERLAPPED: uint32    = 1;
+const WSA_IO_PENDING: int            = 997;
+
+// ── Sync / process constants ──────────────────────────────────────────────────
+
+const INFINITE: uint32          = 0xFFFFFFFF;
+const WAIT_OBJECT_0: uint32     = 0;
+const CTRL_C_EVENT: uint32      = 0;
+const CTRL_CLOSE_EVENT: uint32  = 2;
+
+// ── Memory constants ──────────────────────────────────────────────────────────
+
+const HEAP_ZERO_MEMORY: uint32  = 8;
+
+// ── File constants ────────────────────────────────────────────────────────────
+
+const GENERIC_READ: uint32          = 0x80000000;
+const GENERIC_WRITE: uint32         = 0x40000000;
+const FILE_SHARE_READ: uint32       = 1;
+const FILE_SHARE_WRITE: uint32      = 2;
+const FILE_SHARE_RW: uint32         = 3;
+const OPEN_EXISTING: uint32         = 3;
+const OPEN_ALWAYS: uint32           = 4;   // create if missing, open if present
+const FILE_ATTRIBUTE_NORMAL: uint32 = 0x80;
+const FILE_APPEND_DATA: uint32      = 0x00000004;
+const INVALID_HANDLE_VALUE: int     = -1;
+
+// SECPKG_ATTR_APPLICATION_PROTOCOL (ALPN negotiation result)
+const SECPKG_ATTR_APPLICATION_PROTOCOL: uint32 = 35;
+
+// ── SChannel constants ────────────────────────────────────────────────────────
+
+const SECPKG_CRED_OUTBOUND: uint32     = 2;
+const SECURITY_NATIVE_DREP: uint32     = 0x10;
+const SEC_E_OK: int                    = 0;
+const SEC_I_CONTINUE_NEEDED: int       = 0x00090312;
+const SEC_I_INCOMPLETE_CREDS: int      = 0x00090320;
+const SEC_E_INCOMPLETE_MESSAGE: uint32 = 0x80090318;
+const ISC_REQ_FLAGS: uint32            = 0x0000C11C;
+const SCHANNEL_CRED_VERSION: uint32    = 4;
+const SECBUFFER_VERSION: uint32        = 0;
+const SECBUFFER_EMPTY: uint32          = 0;
+const SECBUFFER_DATA: uint32           = 1;
+const SECBUFFER_TOKEN: uint32          = 2;
+const SECBUFFER_EXTRA: uint32          = 5;
+const SECBUFFER_STREAM_TRAILER: uint32 = 6;
+const SECBUFFER_STREAM_HEADER: uint32  = 7;
+const SECPKG_ATTR_STREAM_SIZES: uint32 = 4;
+
+// ── HTTP.sys constants ────────────────────────────────────────────────────────
+
+const HTTPAPI_VERSION_2: uint32         = 0x00000002;
+const HTTP_INITIALIZE_SERVER: uint32    = 1;
+const HTTP_VERB_GET: int                = 4;
+const HTTP_VERB_HEAD: int               = 5;
+const HTTP_VERB_POST: int               = 6;
+const HTTP_VERB_PUT: int                = 7;
+const HTTP_VERB_DELETE: int             = 8;
+const HTTP_VERB_OPTIONS: int            = 3;
+const HTTP_VERB_PATCH: int              = 19;
+// HTTP_REQUEST field offsets (Win64, HTTP_REQUEST_V1)
+const HTTPREQ_OFF_REQUEST_ID: int       = 16;
+const HTTPREQ_OFF_VERB: int             = 36;
+const HTTPREQ_OFF_RAW_URL_LEN: int      = 42;  // USHORT
+const HTTPREQ_OFF_P_RAW_URL: int        = 56;  // ptr
+const HTTPREQ_OFF_ABSPATH_LEN: int      = 68;  // USHORT (in CookedUrl)
+const HTTPREQ_OFF_P_ABSPATH: int        = 88;  // ptr (in CookedUrl, wide)
+const HTTPREQ_OFF_REMOTE_ADDR: int      = 104; // ptr to SOCKADDR
+// HTTP_RESPONSE field offsets
+const HTTPRESP_OFF_STATUS_CODE: int     = 8;
+const HTTPRESP_OFF_REASON_LEN: int      = 10;
+const HTTPRESP_OFF_P_REASON: int        = 16;  // ptr
+const HTTPRESP_OFF_HEADERS: int         = 24;
+const HTTPRESP_OFF_CHUNK_COUNT: int     = 536;
+const HTTPRESP_OFF_P_CHUNKS: int        = 544;
+// HTTP_DATA_CHUNK FromMemory offsets (DataChunkType=0)
+const HTTPCHUNK_OFF_TYPE: int           = 0;
+const HTTPCHUNK_OFF_P_BUFFER: int       = 8;
+const HTTPCHUNK_OFF_BUFFER_LEN: int     = 16;
+const HTTPCHUNK_SIZE: int               = 24;
+// HTTP_RESPONSE total size (padded)
+const HTTPRESP_SIZE: int                = 560;
+const HTTP_KNOWN_HDR_CONTENT_TYPE: int  = 12;
+const HTTP_KNOWN_HDR_CONTENT_LENGTH: int = 11;
+const HTTP_KNOWN_HDR_STRIDE: int        = 16;  // each HTTP_KNOWN_HEADER = 16 bytes
+
+// ── Zlib constants ────────────────────────────────────────────────────────────
+
+const Z_OK: int              = 0;
+const Z_STREAM_END: int      = 1;
+const Z_NO_FLUSH: int        = 0;
+const Z_FINISH: int          = 4;
+const Z_DEFLATED: int        = 8;
+const Z_DEFAULT_COMPRESSION: int = -1;
+const Z_DEFAULT_STRATEGY: int = 0;
+// windowBits 31 = 15 + 16 → gzip output
+const Z_GZIP_WINDOW_BITS: int = 31;
+const Z_MEM_LEVEL_DEFAULT: int = 8;
+// z_stream size on Win64 with MSVC uLong=4: ~88 bytes; use 128 for safety
+const Z_STREAM_SIZE: int     = 128;
+const ZLIB_VERSION: *char8   = c8"1.2.11".data;
+
+// ── BCrypt constants ──────────────────────────────────────────────────────────
+
+const BCRYPT_ALG_HANDLE_HMAC_FLAG: uint32 = 8;
+// BCRYPT_HASH_LENGTH_PROPERTY and SHA256_ALG_ID_WIDE built at call sites via ToWide()
+const SHA256_HASH_BYTES: int = 32;
+
+// ── WinHTTP constants ─────────────────────────────────────────────────────────
+
+const WINHTTP_ACCESS_TYPE_DEFAULT_PROXY: uint32 = 0;
+const WINHTTP_FLAG_SECURE: uint32               = 0x00800000;
+const WINHTTP_ADDREQ_FLAG_ADD: uint32           = 0x20000000;
+
+// ── SQLite3 constants ─────────────────────────────────────────────────────────
+
+const SQLITE_OK: int           = 0;
+const SQLITE_ROW: int          = 100;
+const SQLITE_DONE: int         = 101;
+const SQLITE_INTEGER: int      = 1;
+const SQLITE_FLOAT: int        = 2;
+const SQLITE_TEXT: int         = 3;
+const SQLITE_BLOB: int         = 4;
+const SQLITE_NULL: int         = 5;
+// SQLITE_TRANSIENT = (sqlite3_destructor_type)(-1) — pointer cast
+const SQLITE_TRANSIENT: int    = -1;
+
+// ── SChannel server-side constants ───────────────────────────────────────────
+
+const SECPKG_CRED_INBOUND: uint32           = 1;
+// ASC_REQ: REPLAY_DETECT|SEQUENCE_DETECT|CONFIDENTIALITY|ALLOCATE_MEMORY|EXTENDED_ERROR|STREAM
+const ASC_REQ_FLAGS: uint32                 = 0x0001811C;
+
+// ── Crypt32 constants ─────────────────────────────────────────────────────────
+
+const PKCS12_NO_PERSIST_KEY: uint32         = 0x00008000;
+const CERT_FIND_ANY: uint32                 = 0;
+// X509_ASN_ENCODING | PKCS_7_ASN_ENCODING
+const CERT_ENCODING_TYPE: uint32            = 0x00010001;
+
+// ── ioctlsocket / select ──────────────────────────────────────────────────────
+
+// Set socket non-blocking: ioctlsocket(sock, FIONBIO, &1)
+const FIONBIO: int                          = 0x8004667E;
+const WSAEWOULDBLOCK: int                   = 10035;
+// fd_set on Win64: 4 bytes fd_count + 4 pad + 64 * 8 bytes fd_array = 520 bytes
+const FD_SET_BYTES: int                     = 520;
+
+// ── Response capture (HTTP.sys full routing) ─────────────────────────────────
+
+// Sentinel socket value: when sock == CAPTURE_SOCK, ConnSend writes to a
+// CaptureCtx buffer instead of a real socket.
+const CAPTURE_SOCK: int                     = -2;
+
+// ── Rate limiting ─────────────────────────────────────────────────────────────
+
+const RATE_PRECISION: int                   = 1000;
+
+// ── Transport mode constants ──────────────────────────────────────────────────
+
+const TRANSPORT_THREAD_POOL: int = 0;
+const TRANSPORT_IOCP: int        = 1;
+const TRANSPORT_HTTPSYS: int     = 2;
+
+// ── Tuning constants ──────────────────────────────────────────────────────────
+
+const DEFAULT_PORT: uint16            = 8080;
+const DEFAULT_WORKERS: int            = 8;
+const BACKLOG: int                    = 256;
+const RECV_TIMEOUT_MS: uint32         = 5000;
+const SEND_TIMEOUT_MS: uint32         = 10000;
+const UPSTREAM_TIMEOUT_MS: uint32     = 10000;
+const RECV_BUF_SIZE: int              = 8192;
+const MAX_FILE_SIZE: int64            = 4194304;
+const MAX_HEADERS: int                = 32;
+const MAX_PATH_LEN: int               = 512;
+const MAX_QUERY_LEN: int              = 1024;
+const MAX_HEADER_NAME: int            = 64;
+const MAX_HEADER_VALUE: int           = 512;
+const BODY_BUF_SIZE: int              = 16384;
+const POOL_QUEUE_CAP: int             = 1024;
+const PROXY_RELAY_BUF: int            = 8192;
+const CONN_POOL_SIZE: int             = 32;
+const MAX_KEEPALIVE_REQUESTS: int     = 100;
+const MAX_UPSTREAMS: int              = 8;
+const DEFAULT_HEALTH_INTERVAL_S: int  = 10;
+const IOCP_ACCEPT_POOL: int           = 64;

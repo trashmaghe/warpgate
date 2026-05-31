@@ -1,0 +1,282 @@
+// Warpgate — Config parser
+
+struct Config {
+    port:    uint16,
+    workers: int,
+
+    // Transport: TRANSPORT_THREAD_POOL / TRANSPORT_IOCP / TRANSPORT_HTTPSYS
+    transport: int,
+
+    // Proxy
+    proxy_enabled:     bool,
+    proxy_prefix:      [char8; 64],
+    proxy_prefix_len:  int,
+    proxy_strip:       bool,
+    upstreams_str:     [char8; 512],
+    upstreams_str_len: int,
+    lb_mode:           int,
+    health_interval_s: int,
+    proxy_tls:         bool,
+    proxy_host:        [char8; 64],
+    proxy_host_len:    int,
+    proxy_port:        uint16,
+
+    // Static
+    static_enabled:    bool,
+    static_dir:        [char8; 256],
+    static_dir_len:    int,
+    static_prefix:     [char8; 64],
+    static_prefix_len: int,
+
+    // Gzip
+    gzip_enabled:      bool,
+    gzip_min_bytes:    int,
+
+    // SQLite
+    db_path:           [char8; 256],
+    db_path_len:       int,
+    db_enabled:        bool,
+
+    // Rate limiting (token bucket per IP)
+    rate_limit_enabled: bool,
+    rate_limit_rps:     int,   // tokens per second
+    rate_limit_burst:   int,   // max bucket size
+
+    // JWT validation (HS256)
+    jwt_enabled:       bool,
+    jwt_secret:        [char8; 128],
+    jwt_secret_len:    int,
+    jwt_prefix:        [char8; 64],   // path prefix that requires JWT (e.g. /api)
+    jwt_prefix_len:    int,
+
+    // Inbound TLS (SChannel server-side)
+    tls_enabled:       bool,
+    tls_cert_file:     [char8; 256],
+    tls_cert_file_len: int,
+    tls_cert_pass:     [char8; 128],
+    tls_cert_pass_len: int,
+
+    // File access logging
+    log_file:          [char8; 256],
+    log_file_len:      int,
+
+    // Hot-reload
+    hot_reload:            bool,
+    hot_reload_interval_s: int,
+}
+
+func DefaultConfig() -> Config {
+    var c: Config = Config {
+        port:              DEFAULT_PORT,
+        workers:           DEFAULT_WORKERS,
+        transport:         TRANSPORT_IOCP,
+        proxy_enabled:     false,
+        proxy_prefix:      [0; 64],
+        proxy_prefix_len:  0,
+        proxy_strip:       true,
+        upstreams_str:     [0; 512],
+        upstreams_str_len: 0,
+        lb_mode:           LB_ROUND_ROBIN,
+        health_interval_s: DEFAULT_HEALTH_INTERVAL_S,
+        proxy_tls:         false,
+        proxy_host:        [0; 64],
+        proxy_host_len:    0,
+        proxy_port:        0,
+        static_enabled:    false,
+        static_dir:        [0; 256],
+        static_dir_len:    0,
+        static_prefix:     [0; 64],
+        static_prefix_len: 0,
+        gzip_enabled:      true,
+        gzip_min_bytes:    512,
+        db_path:           [0; 256],
+        db_path_len:       0,
+        db_enabled:        false,
+        rate_limit_enabled: false,
+        rate_limit_rps:    100,
+        rate_limit_burst:  200,
+        jwt_enabled:       false,
+        jwt_secret:        [0; 128],
+        jwt_secret_len:    0,
+        jwt_prefix:        [0; 64],
+        jwt_prefix_len:    0,
+        tls_enabled:           false,
+        tls_cert_file:         [0; 256],
+        tls_cert_file_len:     0,
+        tls_cert_pass:         [0; 128],
+        tls_cert_pass_len:     0,
+        log_file:              [0; 256],
+        log_file_len:          0,
+        hot_reload:            false,
+        hot_reload_interval_s: 30,
+    };
+    c.proxy_prefix[0] = c8'/'[0]; c.proxy_prefix[1] = c8'a'[0];
+    c.proxy_prefix[2] = c8'p'[0]; c.proxy_prefix[3] = c8'i'[0];
+    c.proxy_prefix_len = 4;
+    c.static_prefix[0] = c8'/'[0]; c.static_prefix_len = 1;
+    let dd = c8"./public";
+    MemCopy(&c.static_dir as *char8, dd.data, 8); c.static_dir_len = 8;
+    let dbp = c8"warpgate.db";
+    MemCopy(&c.db_path as *char8, dbp.data, 11); c.db_path_len = 11;
+    return c;
+}
+
+enum CfgSection { None, Server, Proxy, Static, Database, RateLimit, Auth, Tls, Log }
+
+func LineIs(buf: *char8, off: int, n: int, lit: *char8, lit_n: int) -> bool {
+    if n != lit_n { return false; }
+    return MemEqCI(buf + off, lit, lit_n);
+}
+
+func ReadLine(buf: *char8, buf_len: int, pos: int,
+              out: *char8, cap: int, out_len: *int) -> int {
+    var i: int = pos; var n: int = 0;
+    loop {
+        if i >= buf_len { break; }
+        let c = buf[i]; i = i + 1;
+        if c == c8'\n'[0] { break; }
+        if c == c8'\r'[0] { continue; }
+        if n < cap - 1 { out[n] = c; n = n + 1; }
+    }
+    out[n] = 0 as char8; out_len[0] = n; return i;
+}
+
+func SplitKeyVal(line: *char8, line_len: int,
+                 key: *char8, key_len: *int,
+                 val: *char8, val_len: *int) -> bool {
+    var eq: int = -1; var i: int = 0;
+    loop {
+        if i >= line_len { break; }
+        if line[i] == c8'='[0] { eq = i; break; }
+        i = i + 1;
+    }
+    if eq < 0 { return false; }
+    let ks = SkipWs(line, 0, eq); let ke = TrimRight(line, eq); let kl = ke - ks;
+    if kl <= 0 { return false; }
+    MemCopy(key, line + ks, kl); key[kl] = 0 as char8; key_len[0] = kl;
+    let vs = SkipWs(line, eq + 1, line_len); let ve = TrimRight(line, line_len);
+    var vs2: int = vs; var vl: int = ve - vs;
+    if vl < 0 { vl = 0; }
+    if vl >= 2 && line[vs2] == c8'"'[0] && line[vs2 + vl - 1] == c8'"'[0] {
+        vs2 = vs2 + 1; vl = vl - 2;
+    }
+    MemCopy(val, line + vs2, vl); val[vl] = 0 as char8; val_len[0] = vl;
+    return true;
+}
+
+func IsTruthy(v: *char8) -> bool {
+    return v[0] == c8'1'[0] || v[0] == c8't'[0] || v[0] == c8'T'[0];
+}
+
+func ApplyKV(cfg: *Config, section: CfgSection,
+             key: *char8, kl: int, val: *char8, vl: int) {
+    if section == CfgSection.Server {
+        if LineIs(key, 0, kl, c8"Port".data, 4)      { cfg.port    = Atoi(val) as uint16; }
+        else if LineIs(key, 0, kl, c8"Workers".data, 7)   { cfg.workers = Atoi(val); }
+        else if LineIs(key, 0, kl, c8"Transport".data, 9) {
+            if MemEqCI(val, c8"IOCP".data, 4)          { cfg.transport = TRANSPORT_IOCP; }
+            else if MemEqCI(val, c8"HTTPSys".data, 7)  { cfg.transport = TRANSPORT_HTTPSYS; }
+            else                                        { cfg.transport = TRANSPORT_THREAD_POOL; }
+        }
+        else if LineIs(key, 0, kl, c8"Gzip".data, 4)        { cfg.gzip_enabled = IsTruthy(val); }
+        else if LineIs(key, 0, kl, c8"GzipMinBytes".data, 12) { cfg.gzip_min_bytes = Atoi(val); }
+        else if LineIs(key, 0, kl, c8"HotReload".data, 9)     { cfg.hot_reload = IsTruthy(val); }
+        else if LineIs(key, 0, kl, c8"HotReloadInterval".data, 17) { cfg.hot_reload_interval_s = Atoi(val); }
+        return;
+    }
+    if section == CfgSection.Proxy {
+        if LineIs(key, 0, kl, c8"Enabled".data, 7)       { cfg.proxy_enabled = IsTruthy(val); }
+        else if LineIs(key, 0, kl, c8"Prefix".data, 6)   { cfg.proxy_prefix_len = CopyStr(&cfg.proxy_prefix as *char8, 64, val, vl); }
+        else if LineIs(key, 0, kl, c8"Strip".data, 5)    { cfg.proxy_strip = IsTruthy(val); }
+        else if LineIs(key, 0, kl, c8"Upstreams".data, 9){ cfg.upstreams_str_len = CopyStr(&cfg.upstreams_str as *char8, 512, val, vl); }
+        else if LineIs(key, 0, kl, c8"LbMode".data, 6)   { cfg.lb_mode = if MemEqCI(val, c8"LeastConn".data, 9) { LB_LEAST_CONN } else { LB_ROUND_ROBIN }; }
+        else if LineIs(key, 0, kl, c8"HealthCheck".data, 11) { cfg.health_interval_s = Atoi(val); }
+        else if LineIs(key, 0, kl, c8"Tls".data, 3)          { cfg.proxy_tls = IsTruthy(val); }
+        else if LineIs(key, 0, kl, c8"Host".data, 4)         { cfg.proxy_host_len = CopyStr(&cfg.proxy_host as *char8, 64, val, vl); }
+        // Accept both "UpstreamPort" (preferred) and legacy "Port" for the upstream port
+        else if LineIs(key, 0, kl, c8"UpstreamPort".data, 12) { cfg.proxy_port = Atoi(val) as uint16; }
+        else if LineIs(key, 0, kl, c8"Port".data, 4)          { cfg.proxy_port = Atoi(val) as uint16; }
+        return;
+    }
+    if section == CfgSection.Static {
+        if LineIs(key, 0, kl, c8"Enabled".data, 7) { cfg.static_enabled = IsTruthy(val); }
+        else if LineIs(key, 0, kl, c8"Dir".data, 3)    { cfg.static_dir_len = CopyStr(&cfg.static_dir as *char8, 256, val, vl); }
+        else if LineIs(key, 0, kl, c8"Prefix".data, 6) { cfg.static_prefix_len = CopyStr(&cfg.static_prefix as *char8, 64, val, vl); }
+        return;
+    }
+    if section == CfgSection.Database {
+        if LineIs(key, 0, kl, c8"Enabled".data, 7) { cfg.db_enabled = IsTruthy(val); }
+        else if LineIs(key, 0, kl, c8"Path".data, 4)    { cfg.db_path_len = CopyStr(&cfg.db_path as *char8, 256, val, vl); }
+        return;
+    }
+    if section == CfgSection.RateLimit {
+        if LineIs(key, 0, kl, c8"Enabled".data, 7) { cfg.rate_limit_enabled = IsTruthy(val); }
+        else if LineIs(key, 0, kl, c8"Rps".data, 3)     { cfg.rate_limit_rps   = Atoi(val); }
+        else if LineIs(key, 0, kl, c8"Burst".data, 5)   { cfg.rate_limit_burst  = Atoi(val); }
+        return;
+    }
+    if section == CfgSection.Auth {
+        if LineIs(key, 0, kl, c8"JwtEnabled".data, 10) { cfg.jwt_enabled = IsTruthy(val); }
+        else if LineIs(key, 0, kl, c8"JwtSecret".data, 9)  { cfg.jwt_secret_len = CopyStr(&cfg.jwt_secret as *char8, 128, val, vl); }
+        else if LineIs(key, 0, kl, c8"JwtPrefix".data, 9)  { cfg.jwt_prefix_len = CopyStr(&cfg.jwt_prefix as *char8, 64, val, vl); }
+        return;
+    }
+    if section == CfgSection.Tls {
+        if LineIs(key, 0, kl, c8"Enabled".data, 7)       { cfg.tls_enabled = IsTruthy(val); }
+        else if LineIs(key, 0, kl, c8"CertFile".data, 8) { cfg.tls_cert_file_len = CopyStr(&cfg.tls_cert_file as *char8, 256, val, vl); }
+        else if LineIs(key, 0, kl, c8"CertPass".data, 8) { cfg.tls_cert_pass_len = CopyStr(&cfg.tls_cert_pass as *char8, 128, val, vl); }
+        return;
+    }
+    if section == CfgSection.Log {
+        if LineIs(key, 0, kl, c8"File".data, 4) { cfg.log_file_len = CopyStr(&cfg.log_file as *char8, 256, val, vl); }
+        return;
+    }
+}
+
+func ParseConfig(path: *char8, cfg: *Config) -> bool {
+    let fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ,
+                         0 as *opaque, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+    if fh == INVALID_HANDLE_VALUE { return false; }
+    var fs: int64 = 0; GetFileSizeEx(fh, &fs);
+    var rsz: uint32 = 65536;
+    if fs as uint32 < rsz { rsz = fs as uint32; }
+    var raw: [char8; 65536] = [0; 65536];
+    var br: uint32 = 0;
+    ReadFile(fh, &raw as *char8, rsz, &br, 0 as *opaque);
+    CloseHandle(fh);
+
+    var section: CfgSection = CfgSection.None;
+    var pos: int = 0;
+    var line: [char8; 512] = [0; 512];
+    var ll: int = 0;
+    loop {
+        if pos >= br as int { break; }
+        pos = ReadLine(&raw as *char8, br as int, pos, &line as *char8, 512, &ll);
+        if ll == 0 { continue; }
+        if line[0] == c8'#'[0] || line[0] == c8';'[0] { continue; }
+        if line[0] == c8'['[0] {
+            var end: int = 1;
+            loop {
+                if end >= ll || line[end] == c8']'[0] { break; }
+                end = end + 1;
+            }
+            let sl = end - 1;
+            if LineIs(&line as *char8, 1, sl, c8"Server".data, 6)        { section = CfgSection.Server; }
+            else if LineIs(&line as *char8, 1, sl, c8"Proxy".data, 5)   { section = CfgSection.Proxy; }
+            else if LineIs(&line as *char8, 1, sl, c8"Static".data, 6)  { section = CfgSection.Static; }
+            else if LineIs(&line as *char8, 1, sl, c8"Database".data, 8){ section = CfgSection.Database; }
+            else if LineIs(&line as *char8, 1, sl, c8"RateLimit".data, 9){ section = CfgSection.RateLimit; }
+            else if LineIs(&line as *char8, 1, sl, c8"Auth".data, 4)    { section = CfgSection.Auth; }
+            else if LineIs(&line as *char8, 1, sl, c8"Tls".data, 3)     { section = CfgSection.Tls; }
+            else if LineIs(&line as *char8, 1, sl, c8"Log".data, 3)     { section = CfgSection.Log; }
+            else                                                          { section = CfgSection.None; }
+            continue;
+        }
+        var key: [char8; 64] = [0; 64]; var val: [char8; 512] = [0; 512];
+        var kl: int = 0; var vl: int = 0;
+        if SplitKeyVal(&line as *char8, ll, &key as *char8, &kl, &val as *char8, &vl) {
+            ApplyKV(cfg, section, &key as *char8, kl, &val as *char8, vl);
+        }
+    }
+    return true;
+}

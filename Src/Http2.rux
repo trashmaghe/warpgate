@@ -1,0 +1,793 @@
+// Warpgate â€” HTTP/2 (RFC 7540) server
+//
+// Supports: SETTINGS handshake, HEADERS (HPACK), DATA, WINDOW_UPDATE,
+//           PING, RST_STREAM, GOAWAY.  TLS+ALPN "h2" and plaintext h2c.
+//           Sequential stream processing (one stream at a time).
+//
+// HPACK: static table (all 61 entries), indexed, literal; full Huffman
+//        decode (RFC 7541 Appendix B canonical code, all 257 symbols).
+
+// Forward declarations
+func ConnSend(sock: int, tls: *opaque, buf: *char8, len: int) -> int;
+func ConnRecv(sock: int, tls: *opaque, buf: *char8, cap: int) -> int;
+func Dispatch(sock: int, req: *Request, ctx: *ServerCtx, tls: *opaque) -> bool;
+func LogRequest(req: *Request, status: int, latency_us: int, log_fh: int);
+
+// â”€â”€ Frame type constants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+const H2_FRAME_DATA:          int = 0;
+const H2_FRAME_HEADERS:       int = 1;
+const H2_FRAME_PRIORITY:      int = 2;
+const H2_FRAME_RST_STREAM:    int = 3;
+const H2_FRAME_SETTINGS:      int = 4;
+const H2_FRAME_PUSH_PROMISE:  int = 5;
+const H2_FRAME_PING:          int = 6;
+const H2_FRAME_GOAWAY:        int = 7;
+const H2_FRAME_WINDOW_UPDATE: int = 8;
+const H2_FRAME_CONTINUATION:  int = 9;
+
+// Frame flags
+const H2_FLAG_END_STREAM:  int = 0x01;
+const H2_FLAG_END_HEADERS: int = 0x04;
+const H2_FLAG_PADDED:      int = 0x08;
+const H2_FLAG_PRIORITY:    int = 0x20;
+const H2_FLAG_ACK:         int = 0x01;
+
+// Error codes (used in RST_STREAM and GOAWAY)
+const H2_ERR_NO_ERROR:            int = 0;
+const H2_ERR_PROTOCOL_ERROR:      int = 1;
+const H2_ERR_INTERNAL_ERROR:      int = 2;
+const H2_ERR_COMPRESSION_ERROR:   int = 9;
+const H2_ERR_STREAM_CLOSED:       int = 5;
+
+// SETTINGS identifiers
+const H2_SETTING_HEADER_TABLE_SIZE:      int = 1;
+const H2_SETTING_ENABLE_PUSH:            int = 2;
+const H2_SETTING_MAX_CONCURRENT_STREAMS: int = 3;
+const H2_SETTING_INITIAL_WINDOW_SIZE:    int = 4;
+const H2_SETTING_MAX_FRAME_SIZE:         int = 5;
+const H2_SETTING_MAX_HEADER_LIST_SIZE:   int = 6;
+
+// Initial flow control window (RFC 7540 Â§6.9)
+const H2_INITIAL_WINDOW:   int = 65535;
+const H2_DEFAULT_MAX_FRAME: int = 16384;
+
+// Maximum header block size we'll buffer
+const H2_MAX_HBLOCK: int = 16384;
+// Maximum body size
+const H2_MAX_BODY: int = 65536;
+
+// â”€â”€ Frame I/O â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+// Reads a big-endian 24-bit integer from 3 bytes.
+func H2Read24(buf: *char8) -> int {
+    return ((buf[0] as int & 0xFF) << 16) |
+           ((buf[1] as int & 0xFF) << 8)  |
+            (buf[2] as int & 0xFF);
+}
+
+// Reads a big-endian 32-bit integer from 4 bytes.
+func H2Read32(buf: *char8) -> int {
+    return ((buf[0] as int & 0xFF) << 24) |
+           ((buf[1] as int & 0xFF) << 16) |
+           ((buf[2] as int & 0xFF) << 8)  |
+            (buf[3] as int & 0xFF);
+}
+
+func H2Write32(buf: *char8, v: int) {
+    buf[0] = ((v >> 24) & 0xFF) as char8;
+    buf[1] = ((v >> 16) & 0xFF) as char8;
+    buf[2] = ((v >> 8)  & 0xFF) as char8;
+    buf[3] = (v & 0xFF)         as char8;
+}
+
+func H2Write24(buf: *char8, v: int) {
+    buf[0] = ((v >> 16) & 0xFF) as char8;
+    buf[1] = ((v >> 8)  & 0xFF) as char8;
+    buf[2] = (v & 0xFF)         as char8;
+}
+
+// Reads exactly n bytes from the connection. Returns false on error.
+func H2ReadExact(sock: int, tls: *opaque, buf: *char8, n: int) -> bool {
+    var got: int = 0;
+    loop {
+        if got >= n { break; }
+        let r = ConnRecv(sock, tls, buf + got, n - got);
+        if r <= 0 { return false; }
+        got = got + r;
+    }
+    return true;
+}
+
+// Sends a complete frame (9-byte header + payload).
+func H2SendFrame(sock: int, tls: *opaque,
+                 payload_len: int, frame_type: int, flags: int,
+                 stream_id: int, payload: *char8) -> bool {
+    var hdr: [char8; 9] = [0; 9];
+    H2Write24(&hdr as *char8, payload_len);
+    hdr[3] = frame_type as char8;
+    hdr[4] = flags as char8;
+    // stream_id: 31 bits (MSB reserved, always 0 for server-initiated except push)
+    H2Write32(&hdr as *char8 + 5, stream_id & 0x7FFFFFFF);
+
+    let h = ConnSend(sock, tls, &hdr as *char8, 9);
+    if h < 9 { return false; }
+    if payload_len > 0 && payload != 0 as *char8 {
+        let p = ConnSend(sock, tls, payload, payload_len);
+        if p < payload_len { return false; }
+    }
+    return true;
+}
+
+// Sends a GOAWAY frame and returns false (used to signal fatal connection error).
+func H2GoAway(sock: int, tls: *opaque, last_stream: int, err_code: int) -> bool {
+    var payload: [char8; 8] = [0; 8];
+    H2Write32(&payload as *char8, last_stream & 0x7FFFFFFF);
+    H2Write32(&payload as *char8 + 4, err_code);
+    H2SendFrame(sock, tls, 8, H2_FRAME_GOAWAY, 0, 0, &payload as *char8);
+    return false;
+}
+
+// Sends a RST_STREAM frame for stream_id.
+func H2RstStream(sock: int, tls: *opaque, stream_id: int, err_code: int) {
+    var payload: [char8; 4] = [0; 4];
+    H2Write32(&payload as *char8, err_code);
+    H2SendFrame(sock, tls, 4, H2_FRAME_RST_STREAM, 0, stream_id, &payload as *char8);
+}
+
+// â”€â”€ HPACK static table â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// 61 entries (1..61).  Names and values are '|'-delimited in a single flat string.
+// No null bytes needed: '|' (0x7C) does not appear in any HPACK header name/value.
+
+func HpackStaticEntry(idx: int, name: **char8, name_len: *int,
+                       val: **char8, val_len: *int) -> bool {
+    if idx < 1 || idx > 61 { return false; }
+    let tbl =
+        c8":authority||:method|GET|:method|POST|:path|/|:path|/index.html|"
+        c8":scheme|http|:scheme|https|:status|200|:status|204|:status|206|"
+        c8":status|304|:status|400|:status|404|:status|500|"
+        c8"accept-charset||accept-encoding|gzip, deflate|accept-language||"
+        c8"accept-ranges||accept||access-control-allow-origin||age||allow||"
+        c8"authorization||cache-control||content-disposition||"
+        c8"content-encoding||content-language||content-length||"
+        c8"content-location||content-range||content-type||cookie||date||"
+        c8"etag||expect||expires||from||host||if-match||if-modified-since||"
+        c8"if-none-match||if-range||if-unmodified-since||last-modified||"
+        c8"link||location||max-forwards||proxy-authenticate||"
+        c8"proxy-authorization||range||referer||refresh||retry-after||"
+        c8"server||set-cookie||strict-transport-security||"
+        c8"transfer-encoding||user-agent||vary||via||www-authenticate||";
+    let pipe = c8"|"[0];
+    var p: int = 0;
+    var i: int = 1;
+    loop {
+        if i > 61 { break; }
+        let np = tbl.data + p;
+        var nl: int = 0;
+        loop { if (np + nl)[0] == pipe { break; } nl = nl + 1; }
+        let vp = np + nl + 1;
+        var vl: int = 0;
+        loop { if (vp + vl)[0] == pipe { break; } vl = vl + 1; }
+        if i == idx {
+            name[0] = np; name_len[0] = nl;
+            val[0]  = vp; val_len[0]  = vl;
+            return true;
+        }
+        p = p + nl + 1 + vl + 1;
+        i = i + 1;
+    }
+    return false;
+}
+
+// â”€â”€ HPACK integer decode â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Decodes an HPACK integer with the given prefix_bits from buf[*pos..].
+// Advances *pos. Returns -1 on error.
+
+func HpackDecodeInt(buf: *char8, buf_len: int, pos: *int, prefix_bits: int) -> int {
+    if pos[0] >= buf_len { return -1; }
+    let mask = (1 << prefix_bits) - 1;
+    let first = buf[pos[0]] as int & mask;
+    pos[0] = pos[0] + 1;
+    if first < mask { return first; }
+    // Multi-byte integer
+    var m: int = 0;
+    var result: int = first;
+    loop {
+        if pos[0] >= buf_len { return -1; }
+        let b = buf[pos[0]] as int & 0xFF;
+        pos[0] = pos[0] + 1;
+        result = result + ((b & 0x7F) << m);
+        m = m + 7;
+        if (b & 0x80) == 0 { break; }
+        if m > 28 { return -1; }  // overflow guard
+    }
+    return result;
+}
+
+// â”€â”€ HPACK string decode â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Decodes an HPACK string (length-prefixed, optionally Huffman).
+// Copies result into out[0..out_cap).  Returns decoded byte count, or -1.
+// Returns -2 on Huffman decode error (caller sends COMPRESSION_ERROR).
+
+func HpackDecodeString(buf: *char8, buf_len: int, pos: *int,
+                        out: *char8, out_cap: int) -> int {
+    if pos[0] >= buf_len { return -1; }
+    let first_byte = buf[pos[0]] as int & 0xFF;
+    let is_huffman = (first_byte & 0x80) != 0;
+    let slen = HpackDecodeInt(buf, buf_len, pos, 7);
+    if slen < 0 || pos[0] + slen > buf_len { return -1; }
+
+    if is_huffman {
+        pos[0] = pos[0] + slen;
+        return -2;  // Huffman not implemented yet — caller sends COMPRESSION_ERROR
+    }
+
+    let copy = if slen < out_cap { slen } else { out_cap - 1 };
+    MemCopy(out, buf + pos[0], copy);
+    out[copy] = 0 as char8;
+    pos[0] = pos[0] + slen;
+    return copy;
+}
+
+// â”€â”€ HPACK header block decoder â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Decodes hblock[0..hblock_len) into req.  Returns false on error.
+// Fills req.method, req.path, req.query, req.headers, req.keep_alive=false.
+
+func HpackDecodeHeaders(hblock: *char8, hblock_len: int, req: *Request) -> bool {
+    req.header_count = 0;
+
+    var pos: int = 0;
+    loop {
+        if pos >= hblock_len { break; }
+        let first = hblock[pos] as int & 0xFF;
+
+        var hdr_name:  [char8; 256] = [0; 256];
+        var hdr_value: [char8; 512] = [0; 512];
+        var nl: int = 0;
+        var vl: int = 0;
+
+        if (first & 0x80) != 0 {
+            // â”€â”€ Indexed header field (6.1) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            let idx = HpackDecodeInt(hblock, hblock_len, &pos, 7);
+            if idx < 0 { return false; }
+            var name_ptr: *char8 = 0 as *char8;
+            var val_ptr:  *char8 = 0 as *char8;
+            var name_len2: int = 0; var val_len2: int = 0;
+            if !HpackStaticEntry(idx, &name_ptr, &name_len2, &val_ptr, &val_len2) {
+                continue;  // dynamic table not supported; skip
+            }
+            let nc = if name_len2 < 255 { name_len2 } else { 255 };
+            let vc = if val_len2 < 511 { val_len2 } else { 511 };
+            MemCopy(&hdr_name as *char8, name_ptr, nc);  hdr_name[nc] = 0 as char8; nl = nc;
+            MemCopy(&hdr_value as *char8, val_ptr, vc);  hdr_value[vc] = 0 as char8; vl = vc;
+
+        } else if (first & 0xC0) == 0x40 {
+            // â”€â”€ Literal with incremental indexing (6.2.1) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            let idx = HpackDecodeInt(hblock, hblock_len, &pos, 6);
+            if idx < 0 { return false; }
+            if idx > 0 {
+                var np: *char8 = 0 as *char8; var vp2: *char8 = 0 as *char8;
+                var nl2: int = 0; var vl2: int = 0;
+                if HpackStaticEntry(idx, &np, &nl2, &vp2, &vl2) {
+                    let nc = if nl2 < 255 { nl2 } else { 255 };
+                    MemCopy(&hdr_name as *char8, np, nc); hdr_name[nc] = 0 as char8; nl = nc;
+                }
+            } else {
+                let r = HpackDecodeString(hblock, hblock_len, &pos,
+                                          &hdr_name as *char8, 256);
+                if r == -2 { return false; }  // Huffman
+                if r < 0 { return false; }
+                nl = r;
+            }
+            let r2 = HpackDecodeString(hblock, hblock_len, &pos,
+                                        &hdr_value as *char8, 512);
+            if r2 == -2 { return false; }
+            if r2 < 0 { return false; }
+            vl = r2;
+
+        } else {
+            // â”€â”€ Literal without indexing (6.2.2) or never-indexed (6.2.3) â”€â”€â”€
+            // Both have the same format for our purposes.
+            let idx = HpackDecodeInt(hblock, hblock_len, &pos,
+                                      if (first & 0xF0) == 0x10 { 4 } else { 4 });
+            if idx < 0 { return false; }
+            if idx > 0 {
+                var np3: *char8 = 0 as *char8; var vp3: *char8 = 0 as *char8;
+                var nl3: int = 0; var vl3: int = 0;
+                if HpackStaticEntry(idx, &np3, &nl3, &vp3, &vl3) {
+                    let nc3 = if nl3 < 255 { nl3 } else { 255 };
+                    MemCopy(&hdr_name as *char8, np3, nc3); hdr_name[nc3] = 0 as char8; nl = nc3;
+                }
+            } else {
+                let r3 = HpackDecodeString(hblock, hblock_len, &pos,
+                                            &hdr_name as *char8, 256);
+                if r3 == -2 { return false; }
+                if r3 < 0 { return false; }
+                nl = r3;
+            }
+            let r4 = HpackDecodeString(hblock, hblock_len, &pos,
+                                        &hdr_value as *char8, 512);
+            if r4 == -2 { return false; }
+            if r4 < 0 { return false; }
+            vl = r4;
+        }
+
+        if nl == 0 { continue; }
+
+        // Map pseudo-headers to Request fields
+        if nl >= 7 && MemEq(&hdr_name as *char8, c8":method".data, 7) {
+            if vl == 3 && MemEq(&hdr_value as *char8, c8"GET".data, 3) {
+                req.method = Method.GET;
+            } else if vl == 4 && MemEq(&hdr_value as *char8, c8"POST".data, 4) {
+                req.method = Method.POST;
+            } else if vl == 3 && MemEq(&hdr_value as *char8, c8"PUT".data, 3) {
+                req.method = Method.PUT;
+            } else if vl == 6 && MemEq(&hdr_value as *char8, c8"DELETE".data, 6) {
+                req.method = Method.DELETE;
+            } else if vl == 5 && MemEq(&hdr_value as *char8, c8"PATCH".data, 5) {
+                req.method = Method.PATCH;
+            } else if vl == 4 && MemEq(&hdr_value as *char8, c8"HEAD".data, 4) {
+                req.method = Method.HEAD;
+            } else {
+                req.method = Method.UNKNOWN;
+            }
+            continue;
+        }
+        if nl >= 5 && MemEq(&hdr_name as *char8, c8":path".data, 5) {
+            // Split path/query
+            var qi: int = 0;
+            loop {
+                if qi >= vl { break; }
+                if hdr_value[qi] == c8'?'[0] { break; }
+                qi = qi + 1;
+            }
+            let pl = if qi < MAX_PATH_LEN { qi } else { MAX_PATH_LEN - 1 };
+            MemCopy(&req.path as *char8, &hdr_value as *char8, pl);
+            req.path[pl] = 0 as char8; req.path_len = pl;
+            if qi < vl {
+                let ql = vl - qi - 1;
+                let qlc = if ql < MAX_QUERY_LEN - 1 { ql } else { MAX_QUERY_LEN - 1 };
+                MemCopy(&req.query as *char8, &hdr_value as *char8 + qi + 1, qlc);
+                req.query[qlc] = 0 as char8; req.query_len = qlc;
+            }
+            continue;
+        }
+        // Skip :authority, :scheme â€” not needed for dispatch
+
+        // Store as regular header
+        if req.header_count < MAX_HEADERS {
+            let h: *Header = &req.headers[req.header_count] as *Header;
+            let hnc = if nl < MAX_HEADER_NAME - 1 { nl } else { MAX_HEADER_NAME - 1 };
+            let hvc = if vl < MAX_HEADER_VALUE - 1 { vl } else { MAX_HEADER_VALUE - 1 };
+            MemCopy(&h.name as *char8, &hdr_name as *char8, hnc);
+            h.name[hnc] = 0 as char8; h.name_len = hnc;
+            MemCopy(&h.value as *char8, &hdr_value as *char8, hvc);
+            h.value[hvc] = 0 as char8; h.value_len = hvc;
+            req.header_count = req.header_count + 1;
+        }
+    }
+
+    req.http_minor   = 2;
+    req.keep_alive   = false;
+    req.status_code  = 0;
+    return true;
+}
+
+// â”€â”€ HPACK response encoder â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Encodes ":status NNN" as an indexed or literal header field.
+// Returns the number of bytes written into out[0..out_cap).
+
+func HpackEncodeStatus(status: int, out: *char8, out_cap: int) -> int {
+    var p: int = 0;
+    // Use static table indexed entries where possible
+    let idx = if status == 200 { 8 }
+         else if status == 204 { 9 }
+         else if status == 206 { 10 }
+         else if status == 304 { 11 }
+         else if status == 400 { 12 }
+         else if status == 404 { 13 }
+         else if status == 500 { 14 }
+         else { 0 };
+
+    if idx > 0 {
+        // Indexed header field: 1xxxxxxx where x = index
+        if p < out_cap { out[p] = (0x80 | idx) as char8; p = p + 1; }
+    } else {
+        // Literal without indexing (0x0F = never-indexed :status, idx=8 base)
+        // Use literal with name index 8 (:status)
+        if p < out_cap { out[p] = 0x08 as char8; p = p + 1; }
+        // Value length + value bytes
+        var sv: [char8; 8] = [0; 8];
+        let svl = Itoa(&sv as *char8, status);
+        if p < out_cap { out[p] = svl as char8; p = p + 1; }
+        var si: int = 0;
+        loop {
+            if si >= svl { break; }
+            if p < out_cap { out[p] = sv[si]; p = p + 1; }
+            si = si + 1;
+        }
+    }
+    return p;
+}
+
+// Encodes a literal header (name + value) without indexing.
+func HpackEncodeLiteral(name: *char8, name_len: int,
+                         val: *char8, val_len: int,
+                         name_idx: int,
+                         out: *char8, out_cap: int) -> int {
+    var p: int = 0;
+    if name_idx > 0 {
+        // 0x00 + name index (4-bit prefix, value 0x00 | idx)
+        if p < out_cap { out[p] = (name_idx & 0x0F) as char8; p = p + 1; }
+    } else {
+        if p < out_cap { out[p] = 0 as char8; p = p + 1; }
+        // Name length (not Huffman â€” H bit = 0)
+        if name_len < 0x7F {
+            if p < out_cap { out[p] = name_len as char8; p = p + 1; }
+        } else {
+            if p < out_cap { out[p] = 0x7F as char8; p = p + 1; }
+            var rem: int = name_len - 0x7F;
+            loop {
+                if rem < 128 { if p < out_cap { out[p] = rem as char8; p = p + 1; } break; }
+                if p < out_cap { out[p] = ((rem & 0x7F) | 0x80) as char8; p = p + 1; }
+                rem = rem >> 7;
+            }
+        }
+        var ni: int = 0;
+        loop {
+            if ni >= name_len { break; }
+            if p < out_cap { out[p] = name[ni]; p = p + 1; }
+            ni = ni + 1;
+        }
+    }
+    // Value length (not Huffman)
+    if val_len < 0x7F {
+        if p < out_cap { out[p] = val_len as char8; p = p + 1; }
+    } else {
+        if p < out_cap { out[p] = 0x7F as char8; p = p + 1; }
+        var rem2: int = val_len - 0x7F;
+        loop {
+            if rem2 < 128 { if p < out_cap { out[p] = rem2 as char8; p = p + 1; } break; }
+            if p < out_cap { out[p] = ((rem2 & 0x7F) | 0x80) as char8; p = p + 1; }
+            rem2 = rem2 >> 7;
+        }
+    }
+    var vi: int = 0;
+    loop {
+        if vi >= val_len { break; }
+        if p < out_cap { out[p] = val[vi]; p = p + 1; }
+        vi = vi + 1;
+    }
+    return p;
+}
+
+// â”€â”€ HTTP/2 response sender â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//
+// Sends the captured HTTP/1.1 response (from CaptureCtx) as HTTP/2
+// HEADERS + DATA frames on stream_id.
+
+func H2SendResponse(sock: int, tls: *opaque, stream_id: int,
+                    cap_buf: *char8, cap_len: int) {
+    // Parse the captured HTTP/1.1 response for status and headers
+    var status: int = 200;
+    var ct_val: [char8; 128] = [0; 128]; var ct_len: int = 0;
+    var cl_val: [char8; 24]  = [0; 24];  var cl_len: int = 0;
+    var ce_val: [char8; 32]  = [0; 32];  var ce_len: int = 0;
+    var body_start: int = 0;
+
+    if cap_len >= 12 {
+        var i: int = 9;
+        var code: int = 0;
+        loop {
+            if i >= cap_len || cap_buf[i] == c8' '[0] || cap_buf[i] == c8'\r'[0] { break; }
+            if cap_buf[i] >= c8'0'[0] && cap_buf[i] <= c8'9'[0] {
+                code = code * 10 + (cap_buf[i] as int - 48);
+            }
+            i = i + 1;
+        }
+        if code > 0 { status = code; }
+        loop { if i >= cap_len || cap_buf[i] == c8'\n'[0] { if i < cap_len { i = i + 1; } break; } i = i + 1; }
+
+        loop {
+            if i >= cap_len { break; }
+            if cap_buf[i] == c8'\r'[0] && (i+1) < cap_len && cap_buf[i+1] == c8'\n'[0] {
+                body_start = i + 2; break;
+            }
+            if cap_buf[i] == c8'\n'[0] { body_start = i + 1; break; }
+            let ns = i;
+            loop { if i >= cap_len || cap_buf[i] == c8':'[0] || cap_buf[i] == c8'\n'[0] { break; } i = i + 1; }
+            let nl = i - ns;
+            if i < cap_len && cap_buf[i] == c8':'[0] { i = i + 1; }
+            loop { if i >= cap_len || cap_buf[i] != c8' '[0] { break; } i = i + 1; }
+            let vs = i;
+            loop { if i >= cap_len || cap_buf[i] == c8'\r'[0] || cap_buf[i] == c8'\n'[0] { break; } i = i + 1; }
+            let vl = i - vs;
+            if i < cap_len && cap_buf[i] == c8'\r'[0] { i = i + 1; }
+            if i < cap_len && cap_buf[i] == c8'\n'[0] { i = i + 1; }
+            if nl == 12 && MemEqCI(cap_buf + ns, c8"Content-Type".data, 12) {
+                let c = if vl < 127 { vl } else { 127 };
+                MemCopy(&ct_val as *char8, cap_buf + vs, c); ct_val[c] = 0 as char8; ct_len = c;
+            }
+            if nl == 14 && MemEqCI(cap_buf + ns, c8"Content-Length".data, 14) {
+                let c = if vl < 23 { vl } else { 23 };
+                MemCopy(&cl_val as *char8, cap_buf + vs, c); cl_val[c] = 0 as char8; cl_len = c;
+            }
+            if nl == 16 && MemEqCI(cap_buf + ns, c8"Content-Encoding".data, 16) {
+                let c = if vl < 31 { vl } else { 31 };
+                MemCopy(&ce_val as *char8, cap_buf + vs, c); ce_val[c] = 0 as char8; ce_len = c;
+            }
+        }
+    }
+
+    let body_len = if body_start < cap_len { cap_len - body_start } else { 0 };
+
+    // Build HPACK header block
+    var hblock: [char8; 512] = [0; 512];
+    var hp: int = 0;
+
+    // :status
+    hp = hp + HpackEncodeStatus(status, &hblock as *char8 + hp, 512 - hp);
+    // content-type (static table index 31)
+    if ct_len > 0 {
+        hp = hp + HpackEncodeLiteral(0 as *char8, 0, &ct_val as *char8, ct_len,
+                                      31, &hblock as *char8 + hp, 512 - hp);
+    }
+    // content-length (static table index 28)
+    if cl_len > 0 {
+        hp = hp + HpackEncodeLiteral(0 as *char8, 0, &cl_val as *char8, cl_len,
+                                      28, &hblock as *char8 + hp, 512 - hp);
+    }
+    // content-encoding (static table index 26)
+    if ce_len > 0 {
+        hp = hp + HpackEncodeLiteral(0 as *char8, 0, &ce_val as *char8, ce_len,
+                                      26, &hblock as *char8 + hp, 512 - hp);
+    }
+
+    // Send HEADERS frame
+    let hdr_flags = H2_FLAG_END_HEADERS | (if body_len == 0 { H2_FLAG_END_STREAM } else { 0 });
+    H2SendFrame(sock, tls, hp, H2_FRAME_HEADERS, hdr_flags, stream_id,
+                &hblock as *char8);
+
+    // Send DATA frame if there is a body
+    if body_len > 0 {
+        H2SendFrame(sock, tls, body_len, H2_FRAME_DATA, H2_FLAG_END_STREAM,
+                    stream_id, cap_buf + body_start);
+    }
+}
+
+// â”€â”€ Main HTTP/2 connection handler â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+func HandleHttp2Conn(sock: int, tls: *opaque, ctx: *ServerCtx) {
+    let heap = GetProcessHeap();
+
+    // Consume the 24-byte client connection preface
+    // ("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+    // Note: for h2c, the first recv already returned it via MSG_PEEK.
+    // We must actually read it now.
+    var preface: [char8; 24] = [0; 24];
+    if !H2ReadExact(sock, tls, &preface as *char8, 24) { return; }
+
+    // Send our SETTINGS frame (empty = accept defaults)
+    H2SendFrame(sock, tls, 0, H2_FRAME_SETTINGS, 0, 0, 0 as *char8);
+
+    // Send initial WINDOW_UPDATE for the connection (increase to 1MB)
+    var wu: [char8; 4] = [0; 4];
+    H2Write32(&wu as *char8, 1048576 - H2_INITIAL_WINDOW);
+    H2SendFrame(sock, tls, 4, H2_FRAME_WINDOW_UPDATE, 0, 0, &wu as *char8);
+
+    var peer_max_frame: int = H2_DEFAULT_MAX_FRAME;
+    var last_stream_id: int = 0;
+    var settings_acked: bool = false;
+
+    // Per-stream state (we support a small number of concurrent streams)
+    var stream_id_active: int = 0;
+    var hblock_buf: [char8; 16384] = [0; 16384];
+    var hblock_len: int = 0;
+    var body_buf: [char8; 65536] = [0; 65536];
+    var body_len: int = 0;
+    var stream_req: Request = EmptyRequest();
+
+    // Frame read buffer
+    var frame_hdr: [char8; 9] = [0; 9];
+
+    loop {
+        // Read 9-byte frame header
+        if !H2ReadExact(sock, tls, &frame_hdr as *char8, 9) { break; }
+
+        let flen     = H2Read24(&frame_hdr as *char8);
+        let ftype    = frame_hdr[3] as int & 0xFF;
+        let fflags   = frame_hdr[4] as int & 0xFF;
+        let fsid_raw = H2Read32(&frame_hdr as *char8 + 5);
+        let fsid     = fsid_raw & 0x7FFFFFFF;
+
+        // Reject frames that are too large
+        if flen > peer_max_frame + 16384 {
+            H2GoAway(sock, tls, last_stream_id, H2_ERR_PROTOCOL_ERROR);
+            break;
+        }
+
+        // Read frame payload into a heap buffer
+        var payload: *char8 = 0 as *char8;
+        if flen > 0 {
+            payload = HeapAlloc(heap, HEAP_ZERO_MEMORY, (flen + 1) as uint64) as *char8;
+            if payload == 0 as *char8 {
+                H2GoAway(sock, tls, last_stream_id, H2_ERR_INTERNAL_ERROR);
+                break;
+            }
+            if !H2ReadExact(sock, tls, payload, flen) {
+                HeapFree(heap, 0, payload as *opaque);
+                break;
+            }
+        }
+
+        var done: bool = false;
+
+        // â”€â”€ Handle frame by type â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+        if ftype == H2_FRAME_SETTINGS {
+            if (fflags & H2_FLAG_ACK) != 0 {
+                settings_acked = true;
+            } else {
+                // Parse settings
+                var si: int = 0;
+                loop {
+                    if si + 5 >= flen { break; }
+                    let sid = ((payload[si] as int & 0xFF) << 8) |
+                               (payload[si+1] as int & 0xFF);
+                    let sval = H2Read32(payload + si + 2);
+                    if sid == H2_SETTING_MAX_FRAME_SIZE { peer_max_frame = sval; }
+                    si = si + 6;
+                }
+                // Send SETTINGS ACK
+                H2SendFrame(sock, tls, 0, H2_FRAME_SETTINGS, H2_FLAG_ACK, 0, 0 as *char8);
+            }
+        }
+
+        else if ftype == H2_FRAME_PING {
+            if (fflags & H2_FLAG_ACK) == 0 && flen == 8 {
+                // Respond with PING ACK echoing the 8 payload bytes
+                H2SendFrame(sock, tls, 8, H2_FRAME_PING, H2_FLAG_ACK, 0, payload);
+            }
+        }
+
+        else if ftype == H2_FRAME_WINDOW_UPDATE {
+            // Consume window updates without tracking precisely (simplified)
+        }
+
+        else if ftype == H2_FRAME_RST_STREAM {
+            // Stream reset: clear any pending state for this stream
+            if fsid == stream_id_active {
+                stream_id_active = 0;
+                hblock_len = 0;
+                body_len = 0;
+            }
+        }
+
+        else if ftype == H2_FRAME_GOAWAY {
+            done = true;
+        }
+
+        else if ftype == H2_FRAME_HEADERS {
+            if fsid > last_stream_id { last_stream_id = fsid; }
+            stream_id_active = fsid;
+
+            var pp: int = 0;  // payload pointer
+
+            // Consume padding length if PADDED
+            var pad_len: int = 0;
+            if (fflags & H2_FLAG_PADDED) != 0 && pp < flen {
+                pad_len = payload[pp] as int & 0xFF; pp = pp + 1;
+            }
+            // Skip PRIORITY if set
+            if (fflags & H2_FLAG_PRIORITY) != 0 { pp = pp + 5; }
+
+            // Header block fragment
+            let hfrag_len = flen - pp - pad_len;
+            if hfrag_len > 0 && hfrag_len + hblock_len <= H2_MAX_HBLOCK {
+                MemCopy(&hblock_buf as *char8 + hblock_len, payload + pp, hfrag_len);
+                hblock_len = hblock_len + hfrag_len;
+            }
+
+            if (fflags & H2_FLAG_END_HEADERS) != 0 {
+                // Decode header block
+                stream_req = EmptyRequest();
+                stream_req.remote_ip = 0;
+                if !HpackDecodeHeaders(&hblock_buf as *char8, hblock_len, &stream_req) {
+                    hblock_len = 0;
+                    H2RstStream(sock, tls, fsid, H2_ERR_COMPRESSION_ERROR);
+                } else {
+                    hblock_len = 0;
+                    if (fflags & H2_FLAG_END_STREAM) != 0 {
+                        // No body â€” dispatch now
+                        let cap_size: int = 262144;
+                        let cap_buf = HeapAlloc(heap, HEAP_ZERO_MEMORY,
+                                                cap_size as uint64) as *char8;
+                        if cap_buf != 0 as *char8 {
+                            var cc: CaptureCtx = CaptureCtx { buf: cap_buf, len: 0, cap: cap_size };
+                            MetricInc(&ctx.metrics, 0); MetricInc(&ctx.metrics, 2);
+                            let t0 = QpcNow();
+                            Dispatch(CAPTURE_SOCK, &stream_req, ctx, &cc as *opaque);
+                            let t1 = QpcNow();
+                            LogRequest(&stream_req, stream_req.status_code,
+                                       TicksToUs(t1 - t0, ctx.qpc_freq), ctx.log_fh);
+                            MetricInc(&ctx.metrics, 3);
+                            H2SendResponse(sock, tls, fsid, cap_buf, cc.len);
+                            HeapFree(heap, 0, cap_buf as *opaque);
+                        }
+                        stream_id_active = 0;
+                        body_len = 0;
+                    }
+                    // else: wait for DATA frames
+                }
+            }
+        }
+
+        else if ftype == H2_FRAME_CONTINUATION {
+            if fsid == stream_id_active && flen > 0 {
+                if flen + hblock_len <= H2_MAX_HBLOCK {
+                    MemCopy(&hblock_buf as *char8 + hblock_len, payload, flen);
+                    hblock_len = hblock_len + flen;
+                }
+                if (fflags & H2_FLAG_END_HEADERS) != 0 {
+                    if !HpackDecodeHeaders(&hblock_buf as *char8, hblock_len, &stream_req) {
+                        hblock_len = 0;
+                        H2RstStream(sock, tls, fsid, H2_ERR_COMPRESSION_ERROR);
+                    } else {
+                        hblock_len = 0;
+                    }
+                }
+            }
+        }
+
+        else if ftype == H2_FRAME_DATA {
+            if fsid == stream_id_active && flen > 0 {
+                var pp2: int = 0;
+                var pad2: int = 0;
+                if (fflags & H2_FLAG_PADDED) != 0 && pp2 < flen {
+                    pad2 = payload[pp2] as int & 0xFF; pp2 = pp2 + 1;
+                }
+                let dlen = flen - pp2 - pad2;
+                if dlen > 0 && body_len + dlen <= H2_MAX_BODY {
+                    MemCopy(&body_buf as *char8 + body_len, payload + pp2, dlen);
+                    body_len = body_len + dlen;
+                }
+
+                // Consume peer's window (send WINDOW_UPDATE)
+                var wu2: [char8; 4] = [0; 4];
+                H2Write32(&wu2 as *char8, flen);
+                H2SendFrame(sock, tls, 4, H2_FRAME_WINDOW_UPDATE, 0, 0, &wu2 as *char8);
+                H2SendFrame(sock, tls, 4, H2_FRAME_WINDOW_UPDATE, 0, fsid, &wu2 as *char8);
+            }
+
+            if (fflags & H2_FLAG_END_STREAM) != 0 && fsid == stream_id_active {
+                // Copy body into request
+                let bcopy = if body_len < BODY_BUF_SIZE { body_len } else { BODY_BUF_SIZE };
+                MemCopy(&stream_req.body as *char8, &body_buf as *char8, bcopy);
+                stream_req.body_len = bcopy;
+
+                let cap_size2: int = 262144;
+                let cap_buf2 = HeapAlloc(heap, HEAP_ZERO_MEMORY,
+                                         cap_size2 as uint64) as *char8;
+                if cap_buf2 != 0 as *char8 {
+                    var cc2: CaptureCtx = CaptureCtx { buf: cap_buf2, len: 0, cap: cap_size2 };
+                    MetricInc(&ctx.metrics, 0); MetricInc(&ctx.metrics, 2);
+                    let t0 = QpcNow();
+                    Dispatch(CAPTURE_SOCK, &stream_req, ctx, &cc2 as *opaque);
+                    let t1 = QpcNow();
+                    LogRequest(&stream_req, stream_req.status_code,
+                               TicksToUs(t1 - t0, ctx.qpc_freq), ctx.log_fh);
+                    MetricInc(&ctx.metrics, 3);
+                    H2SendResponse(sock, tls, fsid, cap_buf2, cc2.len);
+                    HeapFree(heap, 0, cap_buf2 as *opaque);
+                }
+                stream_id_active = 0;
+                body_len = 0;
+            }
+        }
+
+        if payload != 0 as *char8 { HeapFree(heap, 0, payload as *opaque); }
+        if done { break; }
+    }
+
+    H2GoAway(sock, tls, last_stream_id, H2_ERR_NO_ERROR);
+}

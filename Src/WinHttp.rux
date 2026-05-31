@@ -1,0 +1,159 @@
+// Warpgate — Outbound HTTP/HTTPS client via WinHTTP
+//
+// All WinHTTP functions take wide (UTF-16LE) strings.  We convert ASCII
+// inputs with ToWide() (defined in Httpsys.rux — compiled together).
+//
+// Usage:
+//   var resp: WinHttpResponse = EmptyWinHttpResponse();
+//   if WinHttpGet("api.example.com", 443, "/v1/status", true, &resp) {
+//       // resp.body[0..resp.body_len) contains the response body
+//   }
+
+// Wide verb strings are built via ToWide() inside WinHttpRequest.
+
+struct WinHttpResponse {
+    status:   int,
+    body:     [char8; 65536],
+    body_len: int,
+}
+
+func EmptyWinHttpResponse() -> WinHttpResponse {
+    return WinHttpResponse { status: 0, body: [0; 65536], body_len: 0 };
+}
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+// Sends an HTTP or HTTPS request.  verb_wide must be a wide string (L"GET" etc.).
+func WinHttpRequest(host: *char8, port: uint16, path: *char8,
+                    tls: bool, verb_wide: *char8,
+                    req_body: *char8, req_body_len: int,
+                    extra_headers: *char8, extra_headers_len: int,
+                    out: *WinHttpResponse) -> bool {
+    // Convert host, path, and fixed strings to wide strings.
+    var host_w:    [char8; 256]  = [0; 256];
+    var path_w:    [char8; 1024] = [0; 1024];
+    var agent_w:   [char8; 32]   = [0; 32];   // L"Warpgate/1.0"
+    var http11_w:  [char8; 20]   = [0; 20];   // L"HTTP/1.1"
+    let host_len = StrLen(host);
+    let path_len = StrLen(path);
+    ToWide(host, host_len, &host_w as *char8, 256);
+    ToWide(path, path_len, &path_w as *char8, 1024);
+    ToWide(c8"Warpgate/1.0".data, 12, &agent_w  as *char8, 32);
+    ToWide(c8"HTTP/1.1".data,      8, &http11_w as *char8, 20);
+
+    let h_session = WinHttpOpen(&agent_w as *char8,
+                                 WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                 0 as *opaque, 0 as *opaque, 0);
+    if h_session == 0 { return false; }
+
+    let h_connect = WinHttpConnect(h_session, &host_w as *char8, port, 0);
+    if h_connect == 0 {
+        WinHttpCloseHandle(h_session);
+        return false;
+    }
+
+    let req_flags: uint32 = if tls { WINHTTP_FLAG_SECURE } else { 0 };
+    let h_request = WinHttpOpenRequest(h_connect, verb_wide,
+                                        &path_w as *char8,
+                                        &http11_w as *opaque,
+                                        0 as *opaque, 0 as *opaque,
+                                        req_flags);
+    if h_request == 0 {
+        WinHttpCloseHandle(h_connect);
+        WinHttpCloseHandle(h_session);
+        return false;
+    }
+
+    // Add extra headers if provided.
+    if extra_headers_len > 0 {
+        var hdr_w: [char8; 2048] = [0; 2048];
+        ToWide(extra_headers, extra_headers_len, &hdr_w as *char8, 2048);
+        WinHttpAddRequestHeaders(h_request, &hdr_w as *char8,
+                                  (extra_headers_len * 2) as uint32,
+                                  WINHTTP_ADDREQ_FLAG_ADD);
+    }
+
+    let send_ok = WinHttpSendRequest(h_request,
+                                      0 as *opaque, 0,
+                                      req_body as *opaque,
+                                      req_body_len as uint32,
+                                      req_body_len as uint32, 0);
+    if !send_ok {
+        WinHttpCloseHandle(h_request);
+        WinHttpCloseHandle(h_connect);
+        WinHttpCloseHandle(h_session);
+        return false;
+    }
+
+    if !WinHttpReceiveResponse(h_request, 0 as *opaque) {
+        WinHttpCloseHandle(h_request);
+        WinHttpCloseHandle(h_connect);
+        WinHttpCloseHandle(h_session);
+        return false;
+    }
+
+    // Read response body.
+    out.body_len = 0;
+    loop {
+        var avail: uint32 = 0;
+        if !WinHttpQueryDataAvailable(h_request, &avail) { break; }
+        if avail == 0 { break; }
+
+        let cap_left = 65536 - out.body_len;
+        if cap_left <= 0 { break; }
+
+        var to_read: uint32 = avail;
+        if to_read as int > cap_left { to_read = cap_left as uint32; }
+
+        var bytes_read: uint32 = 0;
+        WinHttpReadData(h_request,
+                        &out.body as *char8 + out.body_len,
+                        to_read, &bytes_read);
+        out.body_len = out.body_len + bytes_read as int;
+    }
+
+    WinHttpCloseHandle(h_request);
+    WinHttpCloseHandle(h_connect);
+    WinHttpCloseHandle(h_session);
+
+    out.status = 200;  // simplified — full status parsing needs QueryHeaders
+    return true;
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+func WinHttpGet(host: *char8, port: uint16, path: *char8,
+                tls: bool, out: *WinHttpResponse) -> bool {
+    var verb_w: [char8; 10] = [0; 10];
+    ToWide(c8"GET".data, 3, &verb_w as *char8, 10);
+    return WinHttpRequest(host, port, path, tls, &verb_w as *char8,
+                          0 as *char8, 0, 0 as *char8, 0, out);
+}
+
+func WinHttpPost(host: *char8, port: uint16, path: *char8,
+                 tls: bool, body: *char8, body_len: int,
+                 content_type: *char8,
+                 out: *WinHttpResponse) -> bool {
+    var verb_w: [char8; 12] = [0; 12];
+    ToWide(c8"POST".data, 4, &verb_w as *char8, 12);
+
+    // Build "Content-Type: <ct>\r\n" header string.
+    var hdr: [char8; 256] = [0; 256];
+    var hp: int = 0;
+    MemCopy(&hdr as *char8 + hp, c8"Content-Type: ".data, 14); hp = hp + 14;
+    let ct_len = StrLen(content_type);
+    MemCopy(&hdr as *char8 + hp, content_type, ct_len); hp = hp + ct_len;
+    MemCopy(&hdr as *char8 + hp, c8"\r\n".data, 2); hp = hp + 2;
+    hdr[hp] = 0 as char8;
+
+    return WinHttpRequest(host, port, path, tls, &verb_w as *char8,
+                          body, body_len, &hdr as *char8, hp, out);
+}
+
+// ── Upstream health check via HTTP (richer than raw TCP) ─────────────────────
+
+// Pings GET /health on the upstream. Returns true if response was received.
+func HttpHealthCheck(host: *char8, port: uint16, tls: bool) -> bool {
+    var resp: WinHttpResponse = EmptyWinHttpResponse();
+    return WinHttpGet(host, port, c8"/health".data, tls, &resp);
+}

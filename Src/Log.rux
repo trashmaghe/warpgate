@@ -1,0 +1,145 @@
+// Warpgate — Structured access log
+//
+// Line format (stdout):
+//   [2026-05-30 14:23:01.042] 127.0.0.1 GET /path 200 12ms
+//
+// GetLocalTime fills a 16-byte SYSTEMTIME (8 × uint16):
+//   offset  0: wYear          (uint16)
+//   offset  2: wMonth         (uint16)
+//   offset  4: wDayOfWeek     (uint16)  — ignored
+//   offset  6: wDay           (uint16)
+//   offset  8: wHour          (uint16)
+//   offset 10: wMinute        (uint16)
+//   offset 12: wSecond        (uint16)
+//   offset 14: wMilliseconds  (uint16)
+
+// Reads a little-endian uint16 at byte offset from a 16-byte SYSTEMTIME buffer.
+func StField(st: *char8, offset: int) -> int {
+    let lo = st[offset]     as int;
+    let hi = st[offset + 1] as int;
+    return lo | (hi << 8);
+}
+
+// Writes a zero-padded decimal integer of exactly `width` digits into dst.
+// Returns `width`.
+func PadInt(dst: *char8, val: int, width: int) -> int {
+    // Write digits right-to-left into a temp buffer.
+    var tmp: [char8; 8] = [0; 8];
+    var v: int = val;
+    var i: int = width - 1;
+    loop {
+        if i < 0 { break; }
+        tmp[i] = ((v % 10) + 48) as char8;
+        v = v / 10;
+        i = i - 1;
+    }
+    MemCopy(dst, &tmp as *char8, width);
+    return width;
+}
+
+// Writes the method name for req into dst. Returns length.
+func WriteMethod(dst: *char8, req: *Request) -> int {
+    let m: *char8 =
+        if req.method == Method.GET     { c8"GET".data }
+        else if req.method == Method.POST    { c8"POST".data }
+        else if req.method == Method.PUT     { c8"PUT".data }
+        else if req.method == Method.DELETE  { c8"DELETE".data }
+        else if req.method == Method.PATCH   { c8"PATCH".data }
+        else if req.method == Method.HEAD    { c8"HEAD".data }
+        else if req.method == Method.OPTIONS { c8"OPTIONS".data }
+        else                                 { c8"?".data };
+    let len = StrLen(m);
+    MemCopy(dst, m, len);
+    return len;
+}
+
+// Emits one access-log line to stdout and (if log_fh is valid) to a log file.
+// latency_us: microseconds elapsed (from QPC) for the Dispatch call.
+// status: HTTP status integer (200, 404, etc.)
+// log_fh: file handle opened in append mode, or INVALID_HANDLE_VALUE for no file.
+func LogRequest(req: *Request, status: int, latency_us: int, log_fh: int) {
+    var line: [char8; 256] = [0; 256];
+    var p: int = 0;
+
+    // Timestamp: [YYYY-MM-DD HH:MM:SS.mmm]
+    var st: [char8; 16] = [0; 16];
+    GetLocalTime(&st as *opaque);
+
+    line[p] = c8'['[0]; p = p + 1;
+    p = p + PadInt(&line as *char8 + p, StField(&st as *char8, 0), 4);  // year
+    line[p] = c8'-'[0]; p = p + 1;
+    p = p + PadInt(&line as *char8 + p, StField(&st as *char8, 2), 2);  // month
+    line[p] = c8'-'[0]; p = p + 1;
+    p = p + PadInt(&line as *char8 + p, StField(&st as *char8, 6), 2);  // day
+    line[p] = c8' '[0]; p = p + 1;
+    p = p + PadInt(&line as *char8 + p, StField(&st as *char8, 8),  2); // hour
+    line[p] = c8':'[0]; p = p + 1;
+    p = p + PadInt(&line as *char8 + p, StField(&st as *char8, 10), 2); // min
+    line[p] = c8':'[0]; p = p + 1;
+    p = p + PadInt(&line as *char8 + p, StField(&st as *char8, 12), 2); // sec
+    line[p] = c8'.'[0]; p = p + 1;
+    p = p + PadInt(&line as *char8 + p, StField(&st as *char8, 14), 3); // ms
+    line[p] = c8']'[0]; p = p + 1;
+    line[p] = c8' '[0]; p = p + 1;
+
+    // Remote IP
+    var ip_buf: [char8; 16] = [0; 16];
+    let ip_len = Ipv4ToString(req.remote_ip, &ip_buf as *char8);
+    MemCopy(&line as *char8 + p, &ip_buf as *char8, ip_len); p = p + ip_len;
+    line[p] = c8' '[0]; p = p + 1;
+
+    // Method
+    p = p + WriteMethod(&line as *char8 + p, req);
+    line[p] = c8' '[0]; p = p + 1;
+
+    // Path (truncate at 64 chars to keep log lines short)
+    var path_out: int = req.path_len;
+    if path_out > 64 { path_out = 64; }
+    MemCopy(&line as *char8 + p, &req.path as *char8, path_out); p = p + path_out;
+    if req.query_len > 0 {
+        line[p] = c8'?'[0]; p = p + 1;
+        var q_out: int = req.query_len;
+        if q_out > 32 { q_out = 32; }
+        MemCopy(&line as *char8 + p, &req.query as *char8, q_out); p = p + q_out;
+    }
+    line[p] = c8' '[0]; p = p + 1;
+
+    // Status code (3 digits)
+    p = p + Itoa(&line as *char8 + p, status);
+    line[p] = c8' '[0]; p = p + 1;
+
+    // Latency in ms (latency_us / 1000)
+    let latency_ms = latency_us / 1000;
+    p = p + Itoa(&line as *char8 + p, latency_ms);
+    MemCopy(&line as *char8 + p, c8"ms\n".data, 3); p = p + 3;
+
+    Log(&line as *char8, p as uint64);
+
+    // Also write to the access log file if one is configured.
+    if log_fh != INVALID_HANDLE_VALUE && log_fh != 0 {
+        var written: uint64 = 0;
+        WriteFile(log_fh, &line as *char8, p as uint64, &written, 0);
+    }
+}
+
+// ── QPC helpers (used in Pool.rux worker timing) ──────────────────────────────
+
+// Returns current performance-counter tick count.
+func QpcNow() -> int {
+    var v: [int; 1] = [0; 1];
+    QueryPerformanceCounter(&v as *opaque);
+    return v[0];
+}
+
+// Returns QPC frequency (ticks per second). Call once at startup.
+func QpcFreq() -> int {
+    var v: [int; 1] = [0; 1];
+    QueryPerformanceFrequency(&v as *opaque);
+    return v[0];
+}
+
+// Converts a tick-delta to microseconds.
+func TicksToUs(delta: int, freq: int) -> int {
+    if freq == 0 { return 0; }
+    return (delta * 1000000) / freq;
+}

@@ -1,0 +1,264 @@
+// Warpgate — ServerCtx + thread pool (fallback transport)
+
+struct ClientData {
+    socket:    int,
+    remote_ip: uint32,
+}
+
+struct WorkQueue {
+    items:  [int; 1024],
+    head:   int,
+    tail:   int,
+    count:  int,
+    lock:   [uint8; 40],
+    sem:    int,
+}
+
+struct Metrics {
+    requests_total: int,
+    requests_error: int,
+    active:         int,
+    lock:           [uint8; 40],
+}
+
+// ── Rate limit structs (used by ServerCtx) ───────────────────────────────────
+// Functions are in RateLimit.rux; structs live here so ServerCtx can embed them.
+
+struct RateLimitEntry {
+    ip:        uint32,
+    tokens:    int,    // fixed-point (actual * RATE_PRECISION)
+    last_tick: int,    // GetTickCount64() at last check
+    used:      bool,
+}
+
+struct RateLimitTable {
+    entries: [RateLimitEntry; 512],
+    lock:    [uint8; 40],
+}
+
+// ── Central server context ────────────────────────────────────────────────────
+struct ServerCtx {
+    queue:         WorkQueue,
+    config:        Config,
+    heap:          int,
+    conn_pool:     ConnPool,
+    up_pool:       UpstreamPool,
+    metrics:       Metrics,
+    qpc_freq:      int,
+    // IOCP transport
+    iocp_handle:   int,
+    listen_sock:   int,   // needed by IOCP workers for SO_UPDATE_ACCEPT_CONTEXT
+    // HTTP.sys transport
+    httpsys_handle: int,
+    // Optional SQLite database
+    db:            Db,
+    db_enabled:    bool,
+    // Rate limiting
+    rate_limit:    RateLimitTable,
+    // Inbound TLS server credential (loaded from .pfx at startup)
+    srv_cred_lower: int,
+    srv_cred_upper: int,
+
+    // File access log (INVALID_HANDLE_VALUE = stdout only)
+    log_fh:         int,
+
+    // Config hot-reload: guards the Config during reload writes
+    config_lock:    [uint8; 40],
+
+    // HTTP/2 availability (set when h2 compiled in)
+    http2_enabled:  bool,
+
+    // User-supplied request handler (set via WarpgateRun / WarpgateRunConfig).
+    // Signature: func(sock: int, req: *Request, ctx: *ServerCtx, tls: *opaque) -> bool
+    // Called for every request that does not match a built-in route.
+    // Return true to keep the connection alive, false to close it.
+    user_handler:   *opaque,
+}
+
+func MetricInc(m: *Metrics, field: int) {
+    EnterCriticalSection(&m.lock as *opaque);
+    if field == 0 { m.requests_total = m.requests_total + 1; }
+    if field == 1 { m.requests_error = m.requests_error + 1; }
+    if field == 2 { m.active = m.active + 1; }
+    if field == 3 { if m.active > 0 { m.active = m.active - 1; } }
+    LeaveCriticalSection(&m.lock as *opaque);
+}
+
+func QueuePush(q: *WorkQueue, item: int) -> bool {
+    if q.count >= POOL_QUEUE_CAP { return false; }
+    q.items[q.tail] = item;
+    q.tail = (q.tail + 1) % POOL_QUEUE_CAP;
+    q.count = q.count + 1;
+    return true;
+}
+
+func QueuePop(q: *WorkQueue) -> int {
+    if q.count == 0 { return 0; }
+    let item = q.items[q.head];
+    q.head = (q.head + 1) % POOL_QUEUE_CAP;
+    q.count = q.count - 1;
+    return item;
+}
+
+func SubmitWork(ctx: *ServerCtx, client_sock: int, remote_ip: uint32) -> bool {
+    let data = HeapAlloc(ctx.heap, HEAP_ZERO_MEMORY, 16 as uint64) as *ClientData;
+    if data == 0 as *ClientData { return false; }
+    data.socket    = client_sock;
+    data.remote_ip = remote_ip;
+
+    EnterCriticalSection(&ctx.queue.lock as *opaque);
+    let ok = QueuePush(&ctx.queue, data as int);
+    LeaveCriticalSection(&ctx.queue.lock as *opaque);
+
+    if !ok { HeapFree(ctx.heap, 0, data as *opaque); return false; }
+    ReleaseSemaphore(ctx.queue.sem, 1, 0 as *int);
+    return true;
+}
+
+func Dispatch(sock: int, req: *Request, ctx: *ServerCtx, tls: *opaque) -> bool;
+func SendText(sock: int, tls: *opaque, status: *char8, status_len: int,
+              body: *char8, body_len: int, keep_alive: bool);
+func TlsServerAccept(tls: *TlsConn, srv_cred_lower: int, srv_cred_upper: int) -> bool;
+func TlsClose(tls: *TlsConn);
+func ConnRecv(sock: int, tls: *opaque, buf: *char8, cap: int) -> int;
+func LogRequest(req: *Request, status: int, latency_us: int, log_fh: int);
+func TlsGetAlpn(ctx_lower: int, ctx_upper: int, out: *char8, out_cap: int) -> int;
+func HandleHttp2Conn(sock: int, tls: *opaque, ctx: *ServerCtx);
+
+@[Export]
+func WorkerThread(param: *opaque) -> uint32 {
+    let ctx = param as *ServerCtx;
+    let q   = &ctx.queue as *WorkQueue;
+
+    var raw: [char8; 8192] = [0; 8192];
+    var req: Request = EmptyRequest();
+    var rcv_ms: uint32 = RECV_TIMEOUT_MS;
+    var snd_ms: uint32 = SEND_TIMEOUT_MS;
+
+    loop {
+        WaitForSingleObject(q.sem, INFINITE);
+
+        EnterCriticalSection(&q.lock as *opaque);
+        let item = QueuePop(q);
+        LeaveCriticalSection(&q.lock as *opaque);
+
+        if item == 0 { continue; }
+
+        let data = item as *ClientData;
+        let sock = data.socket;
+        let rip  = data.remote_ip;
+        HeapFree(ctx.heap, 0, data as *opaque);
+
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_ms as *char8, 4);
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &snd_ms as *char8, 4);
+
+        MetricInc(&ctx.metrics, 2);
+
+        // Inbound TLS handshake (thread-pool transport only)
+        var conn_tls: TlsConn = EmptyTlsConn(sock);
+        var tls_ptr: *opaque = 0 as *opaque;
+        if ctx.config.tls_enabled && ctx.srv_cred_lower != 0 {
+            if TlsServerAccept(&conn_tls, ctx.srv_cred_lower, ctx.srv_cred_upper) {
+                tls_ptr = &conn_tls as *opaque;
+
+                // ALPN: check if HTTP/2 was negotiated
+                var alpn_buf: [char8; 32] = [0; 32];
+                let alpn_len = TlsGetAlpn(conn_tls.ctx_lower, conn_tls.ctx_upper,
+                                           &alpn_buf as *char8, 32);
+                if ctx.http2_enabled && alpn_len == 2 &&
+                   alpn_buf[0] == c8'h'[0] && alpn_buf[1] == c8'2'[0] {
+                    HandleHttp2Conn(sock, tls_ptr, ctx);
+                    if conn_tls.initialized { TlsClose(&conn_tls); }
+                    MetricInc(&ctx.metrics, 3);
+                    closesocket(sock);
+                    continue;
+                }
+            } else {
+                MetricInc(&ctx.metrics, 3);
+                closesocket(sock);
+                continue;
+            }
+        }
+
+        // h2c detection (plain HTTP/2 without TLS)
+        if ctx.http2_enabled && tls_ptr == 0 as *opaque {
+            var peek: [char8; 24] = [0; 24];
+            let pn = recv(sock, &peek as *char8, 24, 2);  // MSG_PEEK=2
+            if pn == 24 && MemEq(&peek as *char8,
+                                   c8"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".data, 24) {
+                HandleHttp2Conn(sock, 0 as *opaque, ctx);
+                MetricInc(&ctx.metrics, 3);
+                closesocket(sock);
+                continue;
+            }
+        }
+
+        var ka_count: int = 0;
+        loop {
+            MemZero(&raw as *char8, 8192);
+            req = EmptyRequest();
+            req.remote_ip = rip;
+
+            let n = ConnRecv(sock, tls_ptr, &raw as *char8, RECV_BUF_SIZE);
+            if n <= 0 { break; }
+
+            let parse_ok = ParseRequest(&raw as *char8, n, &req);
+            if !parse_ok {
+                SendText(sock, tls_ptr, c8"400 Bad Request".data, 15,
+                         c8"400 Bad Request\n".data, 16, false);
+                MetricInc(&ctx.metrics, 1);
+                break;
+            }
+
+            MetricInc(&ctx.metrics, 0);
+
+            let t0 = QpcNow();
+            let keep = Dispatch(sock, &req, ctx, tls_ptr);
+            let t1 = QpcNow();
+            LogRequest(&req, req.status_code, TicksToUs(t1 - t0, ctx.qpc_freq), ctx.log_fh);
+
+            if !keep { break; }
+            ka_count = ka_count + 1;
+            if ka_count >= MAX_KEEPALIVE_REQUESTS { break; }
+        }
+
+        // TlsClose deletes the per-connection context handle.
+        // cred_lower == 0 so TlsClose won't free the shared server credential.
+        if conn_tls.initialized { TlsClose(&conn_tls); }
+
+        MetricInc(&ctx.metrics, 3);
+        closesocket(sock);
+    }
+    return 0;
+}
+
+func InitPool(ctx: *ServerCtx) -> bool {
+    let q = &ctx.queue as *WorkQueue;
+    InitializeCriticalSection(&q.lock as *opaque);
+    InitializeCriticalSection(&ctx.metrics.lock as *opaque);
+
+    q.sem = CreateSemaphoreA(0 as *opaque, 0, POOL_QUEUE_CAP, 0 as *char8);
+    if q.sem == 0 {
+        LogStr(c8"[warpgate] CreateSemaphore failed\n".data);
+        return false;
+    }
+
+    InitConnPool(&ctx.conn_pool, CONN_POOL_SIZE);
+
+    let workers = ctx.config.workers;
+    var i: int = 0;
+    loop {
+        if i >= workers { break; }
+        var tid: uint32 = 0;
+        let th = CreateThread(0 as *opaque, 0,
+                              WorkerThread as *opaque,
+                              ctx as *opaque, 0, &tid);
+        if th == 0 {
+            LogStr(c8"[warpgate] CreateThread failed\n".data);
+            return false;
+        }
+        CloseHandle(th);
+        i = i + 1;
+    }
+    return true;
+}

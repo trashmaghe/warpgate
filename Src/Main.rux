@@ -1,0 +1,474 @@
+// Warpgate — Entry point and transport selection
+
+// Forward declarations
+func LoadServerCred(cert_file: *char8, cert_pass: *char8,
+                    out_lower: *int, out_upper: *int) -> bool;
+func InitRateLimitTable(t: *RateLimitTable);
+func SendText(sock: int, tls: *opaque, status: *char8, status_len: int,
+              body: *char8, body_len: int, keep_alive: bool);
+func PublishCtrlBlock(active_ptr: *int, listen_ptr: *int, drain_ms: int);
+func ParseConfig(path: *char8, cfg: *Config) -> bool;
+
+// ── Hot-reload watcher thread ─────────────────────────────────────────────────
+
+@[Export]
+func HotReloadThread(param: *opaque) -> uint32 {
+    let ctx = param as *ServerCtx;
+
+    var last_lo: uint32 = 0;
+    var last_hi: uint32 = 0;
+
+    // Read initial modification time
+    let init_fh = CreateFileA(c8"warpgate.toml".data, GENERIC_READ, FILE_SHARE_RW,
+                               0 as *opaque, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+    if init_fh != INVALID_HANDLE_VALUE {
+        var ft: [char8; 8] = [0; 8];
+        GetFileTime(init_fh, 0 as *opaque, 0 as *opaque, &ft as *opaque);
+        CloseHandle(init_fh);
+        last_lo = ReadU32At(&ft as *char8 as int, 0);
+        last_hi = ReadU32At(&ft as *char8 as int, 4);
+    }
+
+    let interval_ms = (if ctx.config.hot_reload_interval_s > 0 {
+                           ctx.config.hot_reload_interval_s
+                       } else { 30 }) as uint32 * 1000;
+
+    loop {
+        Sleep(interval_ms);
+
+        let fh = CreateFileA(c8"warpgate.toml".data, GENERIC_READ, FILE_SHARE_RW,
+                              0 as *opaque, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+        if fh == INVALID_HANDLE_VALUE { continue; }
+
+        var ft2: [char8; 8] = [0; 8];
+        GetFileTime(fh, 0 as *opaque, 0 as *opaque, &ft2 as *opaque);
+        CloseHandle(fh);
+
+        let cur_lo = ReadU32At(&ft2 as *char8 as int, 0);
+        let cur_hi = ReadU32At(&ft2 as *char8 as int, 4);
+
+        if cur_lo == last_lo && cur_hi == last_hi { continue; }
+
+        last_lo = cur_lo; last_hi = cur_hi;
+
+        // Parse new config into a temporary buffer
+        var new_cfg: Config = DefaultConfig();
+        if ParseConfig(c8"warpgate.toml".data, &new_cfg) {
+            // Apply new config under the lock (workers read without holding this lock;
+            // brief inconsistency during the copy is benign on x86/x64).
+            EnterCriticalSection(&ctx.config_lock as *opaque);
+            ctx.config = new_cfg;
+            LeaveCriticalSection(&ctx.config_lock as *opaque);
+            LogStr(c8"[warpgate] config reloaded\n".data);
+        }
+    }
+    return 0;
+}
+
+// ── Shutdown control block ────────────────────────────────────────────────────
+//
+// CtrlHandler cannot receive ctx directly, so Main stores pointers to the
+// live active-connection counter and listen socket in a heap block whose
+// address is published as an environment variable ("_WG_CTL").
+//
+// Layout: [int active_ptr (8)] [int listen_sock_ptr (8)] [int drain_ms (8)]
+
+func PublishCtrlBlock(active_ptr: *int, listen_ptr: *int, drain_ms: int) {
+    let heap = GetProcessHeap();
+    let blk = HeapAlloc(heap, HEAP_ZERO_MEMORY, 24 as uint64) as *char8;
+    if blk == 0 as *char8 { return; }
+    var vi: int = 0; var vv: int = active_ptr as int;
+    loop { if vi >= 8 { break; } blk[vi] = (vv & 0xFF) as char8; vv = vv >> 8; vi = vi + 1; }
+    vi = 0; vv = listen_ptr as int;
+    loop { if vi >= 8 { break; } blk[8 + vi] = (vv & 0xFF) as char8; vv = vv >> 8; vi = vi + 1; }
+    vi = 0; vv = drain_ms;
+    loop { if vi >= 8 { break; } blk[16 + vi] = (vv & 0xFF) as char8; vv = vv >> 8; vi = vi + 1; }
+
+    // Publish the block address as a hex env var so CtrlHandler (different thread) can find it
+    var addr_buf: [char8; 20] = [0; 20];
+    let hex = c8"0123456789ABCDEF";
+    vi = 0; vv = blk as int;
+    loop {
+        if vi >= 16 { break; }
+        addr_buf[15 - vi] = hex.data[vv as int & 0xF];
+        vv = vv >> 4;
+        vi = vi + 1;
+    }
+    addr_buf[16] = 0 as char8;
+    SetEnvironmentVariableA(c8"_WG_CTL".data, &addr_buf as *char8);
+}
+
+@[Export]
+func CtrlHandler(ctrl_type: uint32) -> bool {
+    if ctrl_type != CTRL_C_EVENT && ctrl_type != CTRL_CLOSE_EVENT {
+        return false;
+    }
+
+    LogStr(c8"\n[warpgate] draining connections...\n".data);
+
+    // Retrieve control block published by Main
+    var addr_buf: [char8; 20] = [0; 20];
+    var written: uint32 = 0;
+    GetEnvironmentVariableA(c8"_WG_CTL".data, &addr_buf as *char8, 18, &written);
+
+    var blk: int = 0;
+    if written > 0 {
+        var i: int = 0;
+        loop {
+            if i >= written as int { break; }
+            let c = addr_buf[i];
+            let d = if c >= c8'0'[0] && c <= c8'9'[0] { c as int - 48 }
+                    else if c >= c8'A'[0] && c <= c8'F'[0] { c as int - 55 }
+                    else { 0 };
+            blk = blk * 16 + d;
+            i = i + 1;
+        }
+    }
+
+    if blk != 0 {
+        let blk_ptr = blk as *char8;
+        let listen_ptr = ReadPtrAt(blk, 8) as *int;
+        let drain_ms   = ReadPtrAt(blk, 16);
+
+        // Stop accepting new connections
+        if listen_ptr != 0 as *int {
+            closesocket(listen_ptr[0]);
+        }
+
+        // Poll until active connections drain or timeout expires
+        let active_ptr = ReadPtrAt(blk, 0) as *int;
+        var elapsed: int = 0;
+        loop {
+            if elapsed >= drain_ms { break; }
+            if active_ptr != 0 as *int && active_ptr[0] <= 0 { break; }
+            Sleep(50);
+            elapsed = elapsed + 50;
+        }
+    } else {
+        // Fallback: fixed 5-second grace period
+        Sleep(5000);
+    }
+
+    LogStr(c8"[warpgate] shutdown complete\n".data);
+    WSACleanup();
+    ExitProcess(0);
+    return true;
+}
+
+func LogStartup(ctx: *ServerCtx) {
+    let transport_name: *char8 =
+        if ctx.config.transport == TRANSPORT_IOCP    { c8"IOCP" }
+        else if ctx.config.transport == TRANSPORT_HTTPSYS { c8"HTTP.sys" }
+        else                                              { c8"ThreadPool" };
+    let tn_len = StrLen(transport_name);
+
+    var buf: [char8; 256] = [0; 256];
+    var p: int = 0;
+    MemCopy(&buf as *char8 + p, c8"[warpgate] transport=".data, 21); p = p + 21;
+    MemCopy(&buf as *char8 + p, transport_name, tn_len); p = p + tn_len;
+    MemCopy(&buf as *char8 + p, c8" port=".data, 6); p = p + 6;
+    p = p + Itoa(&buf as *char8 + p, ctx.config.port as int);
+    MemCopy(&buf as *char8 + p, c8" workers=".data, 9); p = p + 9;
+    p = p + Itoa(&buf as *char8 + p, ctx.config.workers);
+    if ctx.config.gzip_enabled {
+        MemCopy(&buf as *char8 + p, c8" gzip=on".data, 8); p = p + 8;
+    }
+    buf[p] = c8'\n'[0]; p = p + 1;
+    Log(&buf as *char8, p as uint64);
+
+    if ctx.config.proxy_enabled && ctx.up_pool.count > 0 {
+        var pb: [char8; 256] = [0; 256];
+        var pp: int = 0;
+        MemCopy(&pb as *char8 + pp, c8"[warpgate] proxy prefix=".data, 24); pp = pp + 24;
+        MemCopy(&pb as *char8 + pp, &ctx.config.proxy_prefix as *char8, ctx.config.proxy_prefix_len);
+        pp = pp + ctx.config.proxy_prefix_len;
+        MemCopy(&pb as *char8 + pp, c8" strip=".data, 7); pp = pp + 7;
+        pb[pp] = if ctx.config.proxy_strip { c8'Y'[0] } else { c8'N'[0] }; pp = pp + 1;
+        MemCopy(&pb as *char8 + pp, c8" upstreams=".data, 11); pp = pp + 11;
+        pp = pp + Itoa(&pb as *char8 + pp, ctx.up_pool.count);
+        pb[pp] = c8'\n'[0]; pp = pp + 1;
+        Log(&pb as *char8, pp as uint64);
+
+        var i: int = 0;
+        loop {
+            if i >= ctx.up_pool.count { break; }
+            let up: *UpstreamDef = &ctx.up_pool.upstreams[i] as *UpstreamDef;
+            var ub: [char8; 128] = [0; 128];
+            var up2: int = 0;
+            MemCopy(&ub as *char8 + up2, c8"  [".data, 3); up2 = up2 + 3;
+            up2 = up2 + Itoa(&ub as *char8 + up2, i);
+            MemCopy(&ub as *char8 + up2, c8"] ".data, 2); up2 = up2 + 2;
+            if up.tls { MemCopy(&ub as *char8 + up2, c8"https://".data, 8); up2 = up2 + 8; }
+            else      { MemCopy(&ub as *char8 + up2, c8"http://".data, 7);  up2 = up2 + 7; }
+            MemCopy(&ub as *char8 + up2, &up.host as *char8, up.host_len); up2 = up2 + up.host_len;
+            ub[up2] = c8':'[0]; up2 = up2 + 1;
+            up2 = up2 + Itoa(&ub as *char8 + up2, up.port as int);
+            ub[up2] = c8'\n'[0]; up2 = up2 + 1;
+            Log(&ub as *char8, up2 as uint64);
+            i = i + 1;
+        }
+    }
+
+    if ctx.config.static_enabled {
+        var sb: [char8; 256] = [0; 256]; var sp: int = 0;
+        MemCopy(&sb as *char8 + sp, c8"[warpgate] static dir=".data, 22); sp = sp + 22;
+        MemCopy(&sb as *char8 + sp, &ctx.config.static_dir as *char8, ctx.config.static_dir_len);
+        sp = sp + ctx.config.static_dir_len;
+        sb[sp] = c8'\n'[0]; sp = sp + 1;
+        Log(&sb as *char8, sp as uint64);
+    }
+
+    if ctx.db_enabled {
+        var db_msg: [char8; 128] = [0; 128]; var dp: int = 0;
+        MemCopy(&db_msg as *char8 + dp, c8"[warpgate] db=".data, 14); dp = dp + 14;
+        MemCopy(&db_msg as *char8 + dp, &ctx.config.db_path as *char8, ctx.config.db_path_len);
+        dp = dp + ctx.config.db_path_len;
+        db_msg[dp] = c8'\n'[0]; dp = dp + 1;
+        Log(&db_msg as *char8, dp as uint64);
+    }
+
+    if ctx.config.rate_limit_enabled {
+        var rb: [char8; 128] = [0; 128]; var rp: int = 0;
+        MemCopy(&rb as *char8 + rp, c8"[warpgate] rate_limit=on rps=".data, 29); rp = rp + 29;
+        rp = rp + Itoa(&rb as *char8 + rp, ctx.config.rate_limit_rps);
+        MemCopy(&rb as *char8 + rp, c8" burst=".data, 7); rp = rp + 7;
+        rp = rp + Itoa(&rb as *char8 + rp, ctx.config.rate_limit_burst);
+        rb[rp] = c8'\n'[0]; rp = rp + 1;
+        Log(&rb as *char8, rp as uint64);
+    }
+
+    if ctx.config.jwt_enabled {
+        var jb: [char8; 128] = [0; 128]; var jp: int = 0;
+        MemCopy(&jb as *char8 + jp, c8"[warpgate] jwt=on prefix=".data, 25); jp = jp + 25;
+        if ctx.config.jwt_prefix_len > 0 {
+            MemCopy(&jb as *char8 + jp, &ctx.config.jwt_prefix as *char8,
+                    ctx.config.jwt_prefix_len);
+            jp = jp + ctx.config.jwt_prefix_len;
+        } else {
+            MemCopy(&jb as *char8 + jp, c8"(all)".data, 5); jp = jp + 5;
+        }
+        jb[jp] = c8'\n'[0]; jp = jp + 1;
+        Log(&jb as *char8, jp as uint64);
+    }
+}
+
+@[Export]
+func WarpgateRun(handler: *opaque) -> int {
+    SetConsoleCtrlHandler(CtrlHandler as *opaque, true);
+
+    var wsadata: [uint8; 408] = [0; 408];
+    if WSAStartup(0x0202, &wsadata as *opaque) != 0 {
+        LogStr(c8"[warpgate] WSAStartup failed\n".data);
+        return 1;
+    }
+
+    var ctx: ServerCtx = ServerCtx {
+        queue: WorkQueue {
+            items: [0; 1024], head: 0, tail: 0, count: 0, lock: [0; 40], sem: 0,
+        },
+        config:         DefaultConfig(),
+        heap:           0,
+        conn_pool:      ConnPool {
+            slots: [ConnSlot { sock: 0, in_use: false, healthy: false, up_idx: -1 }; 32],
+            lock: [0; 40], size: 0,
+        },
+        up_pool:        UpstreamPool {
+            upstreams: [UpstreamDef {
+                host: [0; 64], host_len: 0, port: 0,
+                tls: false, healthy: true, active: 0,
+            }; 8],
+            count: 0, rr_idx: 0, lb_mode: LB_ROUND_ROBIN,
+            health_interval_ms: 0, lock: [0; 40],
+        },
+        metrics:        Metrics { requests_total: 0, requests_error: 0, active: 0, lock: [0; 40] },
+        qpc_freq:       0,
+        iocp_handle:    0,
+        listen_sock:    0,
+        httpsys_handle: 0,
+        db:             Db { handle: 0, lock: [0; 40], open: false },
+        db_enabled:     false,
+        log_fh:         INVALID_HANDLE_VALUE,
+        config_lock:    [0; 40],
+        http2_enabled:  true,
+        rate_limit:     RateLimitTable {
+            entries: [RateLimitEntry {
+                ip: 0, tokens: 0, last_tick: 0, used: false,
+            }; 512],
+            lock: [0; 40],
+        },
+        srv_cred_lower: 0,
+        srv_cred_upper: 0,
+        user_handler:   0 as *opaque,
+    };
+    ctx.user_handler = handler;
+
+    ctx.heap     = GetProcessHeap();
+    ctx.qpc_freq = QpcFreq();
+
+    if ParseConfig(c8"warpgate.toml".data, &ctx.config) {
+        LogStr(c8"[warpgate] loaded warpgate.toml\n".data);
+    } else {
+        LogStr(c8"[warpgate] warpgate.toml not found — using defaults\n".data);
+    }
+
+    // Rate limit table
+    InitRateLimitTable(&ctx.rate_limit);
+
+    // Config hot-reload lock
+    InitializeCriticalSection(&ctx.config_lock as *opaque);
+
+    // Build UpstreamPool
+    InitUpstreamPool(&ctx.up_pool,
+                     &ctx.config.upstreams_str as *char8,
+                     ctx.config.upstreams_str_len,
+                     ctx.config.lb_mode,
+                     ctx.config.health_interval_s);
+
+    // Backward compat single upstream
+    if ctx.up_pool.count == 0 && ctx.config.proxy_host_len > 0 && ctx.config.proxy_port > 0 {
+        let def: *UpstreamDef = &ctx.up_pool.upstreams[0] as *UpstreamDef;
+        MemCopy(&def.host as *char8, &ctx.config.proxy_host as *char8, ctx.config.proxy_host_len);
+        def.host[ctx.config.proxy_host_len] = 0 as char8;
+        def.host_len = ctx.config.proxy_host_len;
+        def.port     = ctx.config.proxy_port;
+        def.tls      = ctx.config.proxy_tls;
+        def.healthy  = true;
+        ctx.up_pool.count = 1;
+    }
+
+    // Inbound TLS — load server certificate if enabled
+    if ctx.config.tls_enabled {
+        if ctx.config.tls_cert_file_len > 0 {
+            var cert_file_buf: [char8; 257] = [0; 257];
+            MemCopy(&cert_file_buf as *char8, &ctx.config.tls_cert_file as *char8,
+                    ctx.config.tls_cert_file_len);
+            cert_file_buf[ctx.config.tls_cert_file_len] = 0 as char8;
+
+            var cert_pass_buf: [char8; 129] = [0; 129];
+            MemCopy(&cert_pass_buf as *char8, &ctx.config.tls_cert_pass as *char8,
+                    ctx.config.tls_cert_pass_len);
+            cert_pass_buf[ctx.config.tls_cert_pass_len] = 0 as char8;
+
+            if LoadServerCred(&cert_file_buf as *char8, &cert_pass_buf as *char8,
+                              &ctx.srv_cred_lower, &ctx.srv_cred_upper) {
+                LogStr(c8"[warpgate] inbound TLS ready\n".data);
+            } else {
+                LogStr(c8"[warpgate] WARNING: inbound TLS cert load failed\n".data);
+            }
+        } else {
+            LogStr(c8"[warpgate] WARNING: TLS enabled but no CertFile configured\n".data);
+        }
+    }
+
+    // SQLite
+    if ctx.config.db_enabled {
+        if DbOpen(&ctx.config.db_path as *char8, &ctx.db) {
+            ctx.db_enabled = true;
+        } else {
+            LogStr(c8"[warpgate] db open failed\n".data);
+        }
+    }
+
+    // Open access log file (append mode) if configured
+    if ctx.config.log_file_len > 0 {
+        var lf_buf: [char8; 257] = [0; 257];
+        MemCopy(&lf_buf as *char8, &ctx.config.log_file as *char8, ctx.config.log_file_len);
+        lf_buf[ctx.config.log_file_len] = 0 as char8;
+        let lf_fh = CreateFileA(&lf_buf as *char8,
+                                 FILE_APPEND_DATA, FILE_SHARE_RW,
+                                 0 as *opaque, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+        if lf_fh != INVALID_HANDLE_VALUE {
+            ctx.log_fh = lf_fh;
+            LogStr(c8"[warpgate] access log: ".data);
+            LogStr(&lf_buf as *char8);
+            LogStr(c8"\n".data);
+        } else {
+            LogStr(c8"[warpgate] WARNING: could not open log file\n".data);
+        }
+    }
+
+    // Start hot-reload watcher thread if enabled
+    if ctx.config.hot_reload {
+        var hrtid: uint32 = 0;
+        let hrth = CreateThread(0 as *opaque, 0,
+                                HotReloadThread as *opaque,
+                                &ctx as *opaque, 0, &hrtid);
+        if hrth != 0 {
+            CloseHandle(hrth);
+            LogStr(c8"[warpgate] hot-reload enabled\n".data);
+        }
+    }
+
+    LogStartup(&ctx);
+
+    // HTTP.sys transport bypasses raw sockets entirely
+    if ctx.config.transport == TRANSPORT_HTTPSYS {
+        RunHttpSys(&ctx);
+        return 0;
+    }
+
+    // Create listen socket (used by IOCP and ThreadPool)
+    let srv = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP,
+                        0 as *opaque, 0, WSA_FLAG_OVERLAPPED);
+    if srv == INVALID_SOCKET {
+        LogStr(c8"[warpgate] socket() failed\n".data);
+        WSACleanup(); return 1;
+    }
+    ctx.listen_sock = srv;
+
+    var one: uint32 = 1;
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one as *char8, 4);
+
+    var addr: SockAddrIn = SockAddrIn {
+        sin_family: AF_INET as uint16,
+        sin_port:   htons(ctx.config.port),
+        sin_addr:   0, sin_zero: [0; 8],
+    };
+    if bind(srv, &addr as *opaque, 16) != 0 {
+        LogStr(c8"[warpgate] bind() failed\n".data);
+        closesocket(srv); WSACleanup(); return 1;
+    }
+    listen(srv, BACKLOG);
+
+    var lmsg: [char8; 64] = [0; 64]; var lp: int = 0;
+    MemCopy(&lmsg as *char8, c8"[warpgate] listening on :".data, 25); lp = 25;
+    lp = lp + Itoa(&lmsg as *char8 + lp, ctx.config.port as int);
+    lmsg[lp] = c8'\n'[0]; lp = lp + 1;
+    Log(&lmsg as *char8, lp as uint64);
+
+    if ctx.config.proxy_enabled {
+        SpawnHealthChecker(&ctx.up_pool);
+    }
+
+    // Publish control block so CtrlHandler can poll active connections and
+    // stop the listen socket on Ctrl+C / window close.
+    PublishCtrlBlock(&ctx.metrics.active, &ctx.listen_sock, 10000);
+
+    // ── IOCP transport — RunIocp never returns ─────────────────────────────────
+    if ctx.config.transport == TRANSPORT_IOCP {
+        RunIocp(&ctx);
+        // unreachable
+        return 0;
+    }
+
+    // ── Thread-pool transport ──────────────────────────────────────────────────
+    if !InitPool(&ctx) { closesocket(srv); WSACleanup(); return 1; }
+
+    var ca: SockAddrIn = SockAddrIn {
+        sin_family: 0, sin_port: 0, sin_addr: 0, sin_zero: [0; 8],
+    };
+    var addrlen: int = 16;
+
+    loop {
+        let client = accept(srv, &ca as *opaque, &addrlen);
+        if client == INVALID_SOCKET { continue; }
+        if !SubmitWork(&ctx, client, ca.sin_addr) {
+            SendText(client, 0 as *opaque, c8"503 Service Unavailable".data, 23,
+                     c8"server overloaded\n".data, 18, false);
+            closesocket(client);
+        }
+    }
+
+    WSACleanup();
+    return 0;
+}

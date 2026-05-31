@@ -1,0 +1,255 @@
+// Warpgate — Static file server with ETag + 304 Not Modified support
+
+func LastDot(path: *char8, len: int) -> int {
+    var i: int = len - 1;
+    loop {
+        if i < 0 { return -1; }
+        if path[i] == c8'.'[0] { return i; }
+        i = i - 1;
+    }
+}
+
+func ExtEq(path: *char8, dot: int, plen: int, ext: *char8, elen: int) -> bool {
+    if plen - dot - 1 != elen { return false; }
+    return MemEqCI(path + dot + 1, ext, elen);
+}
+
+func GetMimeType(path: *char8, path_len: int, out_len: *int) -> *char8 {
+    let dot = LastDot(path, path_len);
+    if dot < 0 { out_len[0] = 24; return c8"application/octet-stream".data; }
+    if ExtEq(path, dot, path_len, c8"html".data, 4) || ExtEq(path, dot, path_len, c8"htm".data, 3) {
+        out_len[0] = 24; return c8"text/html; charset=utf-8".data; }
+    if ExtEq(path, dot, path_len, c8"css".data, 3) {
+        out_len[0] = 8; return c8"text/css".data; }
+    if ExtEq(path, dot, path_len, c8"js".data, 2) {
+        out_len[0] = 22; return c8"application/javascript".data; }
+    if ExtEq(path, dot, path_len, c8"json".data, 4) {
+        out_len[0] = 16; return c8"application/json".data; }
+    if ExtEq(path, dot, path_len, c8"txt".data, 3) {
+        out_len[0] = 26; return c8"text/plain; charset=utf-8".data; }
+    if ExtEq(path, dot, path_len, c8"png".data, 3) {
+        out_len[0] = 9; return c8"image/png".data; }
+    if ExtEq(path, dot, path_len, c8"jpg".data, 3) || ExtEq(path, dot, path_len, c8"jpeg".data, 4) {
+        out_len[0] = 10; return c8"image/jpeg".data; }
+    if ExtEq(path, dot, path_len, c8"gif".data, 3) {
+        out_len[0] = 9; return c8"image/gif".data; }
+    if ExtEq(path, dot, path_len, c8"ico".data, 3) {
+        out_len[0] = 13; return c8"image/x-icon".data; }
+    if ExtEq(path, dot, path_len, c8"svg".data, 3) {
+        out_len[0] = 13; return c8"image/svg+xml".data; }
+    if ExtEq(path, dot, path_len, c8"woff".data, 4) {
+        out_len[0] = 9; return c8"font/woff".data; }
+    if ExtEq(path, dot, path_len, c8"woff2".data, 5) {
+        out_len[0] = 10; return c8"font/woff2".data; }
+    if ExtEq(path, dot, path_len, c8"ttf".data, 3) {
+        out_len[0] = 13; return c8"font/truetype".data; }
+    if ExtEq(path, dot, path_len, c8"xml".data, 3) {
+        out_len[0] = 15; return c8"application/xml".data; }
+    if ExtEq(path, dot, path_len, c8"pdf".data, 3) {
+        out_len[0] = 15; return c8"application/pdf".data; }
+    if ExtEq(path, dot, path_len, c8"webp".data, 4) {
+        out_len[0] = 10; return c8"image/webp".data; }
+    if ExtEq(path, dot, path_len, c8"mp4".data, 3) {
+        out_len[0] = 9; return c8"video/mp4".data; }
+    if ExtEq(path, dot, path_len, c8"mp3".data, 3) {
+        out_len[0] = 10; return c8"audio/mpeg".data; }
+    out_len[0] = 24; return c8"application/octet-stream".data;
+}
+
+func PathMatchesStatic(req: *Request, cfg: *Config) -> bool {
+    let plen = cfg.static_prefix_len;
+    if plen == 0 { return false; }
+    if req.path_len < plen { return false; }
+    return MemEq(&req.path as *char8, &cfg.static_prefix as *char8, plen);
+}
+
+func BuildFsPath(req: *Request, cfg: *Config,
+                 fs: *char8, fs_len: *int) -> bool {
+    var dec: [char8; 512] = [0; 512];
+    let dl = UrlDecode(&req.path as *char8, req.path_len, &dec as *char8);
+    if HasDotDot(&dec as *char8, dl) { return false; }
+    let dir = cfg.static_dir_len;
+    var total: int = dir + dl;
+    var need_index: bool = false;
+    if dl == 0 || dec[dl - 1] == c8'/'[0] { need_index = true; total = total + 10; }
+    if total >= 768 { return false; }
+    MemCopy(fs, &cfg.static_dir as *char8, dir);
+    MemCopy(fs + dir, &dec as *char8, dl);
+    if need_index { MemCopy(fs + dir + dl, c8"index.html".data, 10); }
+    fs[total] = 0 as char8;
+    fs_len[0] = total;
+    return true;
+}
+
+// ── ETag ──────────────────────────────────────────────────────────────────────
+
+// FILETIME: two uint32 (low, high) = 8 bytes at offsets 0 and 4.
+func GetFileWriteTime(path: *char8, ft_low: *uint32, ft_high: *uint32) -> bool {
+    let fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ,
+                         0 as *opaque, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+    if fh == INVALID_HANDLE_VALUE { return false; }
+    var ft: [char8; 8] = [0; 8];
+    let ok = GetFileTime(fh, 0 as *opaque, 0 as *opaque, &ft as *opaque);
+    CloseHandle(fh);
+    if !ok { return false; }
+    ft_low[0]  = ReadU32At(&ft as *char8 as int, 0);
+    ft_high[0] = ReadU32At(&ft as *char8 as int, 4);
+    return true;
+}
+
+// Writes a hex-encoded ETag into buf. Returns length. Format: "\"<hex>\""
+func MakeETag(file_size: int, ft_low: uint32, ft_high: uint32,
+              buf: *char8) -> int {
+    // ETag = file_size XOR ft_low XOR (ft_high << 5) as a single 32-bit value
+    let raw = (file_size as uint32) ^ ft_low ^ (ft_high << 5 | ft_high >> 27);
+    buf[0] = c8'"'[0];
+    let hex_chars = c8"0123456789abcdef";
+    var i: int = 1;
+    var shift: int = 28;
+    loop {
+        if shift < 0 { break; }
+        let nibble = (raw >> shift as uint32) & 0xF;
+        buf[i] = hex_chars.data[nibble as int];
+        i = i + 1;
+        shift = shift - 4;
+    }
+    buf[i] = c8'"'[0];
+    i = i + 1;
+    buf[i] = 0 as char8;
+    return i;
+}
+
+// Forward declarations
+func ConnSend(sock: int, tls: *opaque, buf: *char8, len: int) -> int;
+func SendText(sock: int, tls: *opaque, status: *char8, status_len: int,
+              body: *char8, body_len: int, keep_alive: bool);
+
+// Sends a bare "304 Not Modified" with keep-alive header.
+func Send304(sock: int, tls: *opaque, etag: *char8, etag_len: int, keep_alive: bool) {
+    var out: [char8; 256] = [0; 256];
+    var p: int = 0;
+    MemCopy(&out as *char8 + p, c8"HTTP/1.1 304 Not Modified\r\n".data, 27); p = p + 27;
+    MemCopy(&out as *char8 + p, c8"ETag: ".data, 6); p = p + 6;
+    MemCopy(&out as *char8 + p, etag, etag_len); p = p + etag_len;
+    MemCopy(&out as *char8 + p, c8"\r\n".data, 2); p = p + 2;
+    if keep_alive {
+        MemCopy(&out as *char8 + p, c8"Connection: keep-alive\r\n".data, 24); p = p + 24;
+    } else {
+        MemCopy(&out as *char8 + p, c8"Connection: close\r\n".data, 19); p = p + 19;
+    }
+    MemCopy(&out as *char8 + p, c8"\r\n".data, 2); p = p + 2;
+    ConnSend(sock, tls, &out as *char8, p);
+}
+
+// ── File read ─────────────────────────────────────────────────────────────────
+
+func ReadWholeFile(heap: int, path: *char8, out_size: *int) -> *char8 {
+    let fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ,
+                         0 as *opaque, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+    if fh == INVALID_HANDLE_VALUE { out_size[0] = 0; return 0 as *char8; }
+    var fs: int64 = 0;
+    GetFileSizeEx(fh, &fs);
+    if fs > MAX_FILE_SIZE { CloseHandle(fh); out_size[0] = -1; return 0 as *char8; }
+    let sz = fs as uint32;
+    if sz == 0 { CloseHandle(fh); out_size[0] = 0; return 0 as *char8; }
+    let buf = HeapAlloc(heap, HEAP_ZERO_MEMORY, sz as uint64) as *char8;
+    if buf == 0 as *char8 { CloseHandle(fh); out_size[0] = 0; return 0 as *char8; }
+    var read: uint32 = 0;
+    ReadFile(fh, buf, sz, &read, 0 as *opaque);
+    CloseHandle(fh);
+    out_size[0] = read as int;
+    return buf;
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+func ServeFile(sock: int, req: *Request, ctx: *ServerCtx, tls: *opaque) {
+    if req.method != Method.GET && req.method != Method.HEAD {
+        req.status_code = 405;
+        SendText(sock, tls, c8"405 Method Not Allowed".data, 22,
+                 c8"405 Method Not Allowed\n".data, 23, false);
+        return;
+    }
+
+    var fs_path: [char8; 768] = [0; 768];
+    var fs_len: int = 0;
+    if !BuildFsPath(req, &ctx.config, &fs_path as *char8, &fs_len) {
+        req.status_code = 403;
+        SendText(sock, tls, c8"403 Forbidden".data, 13,
+                 c8"403 Forbidden\n".data, 14, false); return;
+    }
+
+    // Compute ETag from last-write FILETIME + file size.
+    var ft_low: uint32 = 0; var ft_high: uint32 = 0;
+    var etag: [char8; 16] = [0; 16];
+    var etag_len: int = 0;
+
+    var file_size: int = 0;
+    let file_data = ReadWholeFile(ctx.heap, &fs_path as *char8, &file_size);
+
+    if file_size == -1 {
+        req.status_code = 413;
+        SendText(sock, tls, c8"413 Content Too Large".data, 21,
+                 c8"file exceeds 4 MB\n".data, 18, false); return;
+    }
+    if file_data == 0 as *char8 {
+        req.status_code = 404;
+        SendText(sock, tls, c8"404 Not Found".data, 13,
+                 c8"404 Not Found\n".data, 14, false); return;
+    }
+
+    if GetFileWriteTime(&fs_path as *char8, &ft_low, &ft_high) {
+        etag_len = MakeETag(file_size, ft_low, ft_high, &etag as *char8);
+    }
+
+    // Check If-None-Match
+    if etag_len > 0 {
+        let inm = GetHeader(req, c8"If-None-Match".data, 13);
+        if inm != 0 as *char8 {
+            let inm_len = StrLen(inm);
+            if inm_len == etag_len && MemEq(inm, &etag as *char8, etag_len) {
+                HeapFree(ctx.heap, 0, file_data as *opaque);
+                req.status_code = 304;
+                Send304(sock, tls, &etag as *char8, etag_len, req.keep_alive);
+                return;
+            }
+        }
+    }
+
+    var mime_len: int = 0;
+    let mime = GetMimeType(&fs_path as *char8, fs_len, &mime_len);
+
+    // Build headers — Content-Length = real file_size; body streamed below.
+    var hdr: [char8; 640] = [0; 640];
+    var hp: int = 0;
+    hp = hp + BuildResponse(&hdr as *char8, 640,
+                             c8"200 OK".data, 6,
+                             mime, mime_len,
+                             0 as *char8, file_size,
+                             req.keep_alive);
+
+    // Append ETag header before the blank line.
+    if etag_len > 0 {
+        // Inject ETag before the trailing \r\n\r\n by backing up 2 bytes.
+        hp = hp - 2;
+        MemCopy(&hdr as *char8 + hp, c8"ETag: ".data, 6); hp = hp + 6;
+        MemCopy(&hdr as *char8 + hp, &etag as *char8, etag_len); hp = hp + etag_len;
+        MemCopy(&hdr as *char8 + hp, c8"\r\n\r\n".data, 4); hp = hp + 4;
+    }
+
+    ConnSend(sock, tls, &hdr as *char8, hp);
+    req.status_code = 200;
+
+    if req.method == Method.GET && file_size > 0 {
+        var offset: int = 0;
+        loop {
+            if offset >= file_size { break; }
+            var chunk: int = 32768;
+            if file_size - offset < chunk { chunk = file_size - offset; }
+            let n = ConnSend(sock, tls, file_data + offset, chunk);
+            if n <= 0 { break; }
+            offset = offset + n;
+        }
+    }
+    HeapFree(ctx.heap, 0, file_data as *opaque);
+}

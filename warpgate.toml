@@ -1,0 +1,63 @@
+[Server]
+Port      = 8080
+Workers   = 8
+# Transport: IOCP (default, best scalability), HTTPSys (kernel-mode), ThreadPool (simple)
+Transport = IOCP
+# Gzip: compress responses larger than GzipMinBytes (requires zlib1.dll)
+Gzip            = true
+GzipMinBytes    = 512
+# Hot-reload: re-parse warpgate.toml when the file changes (no restart needed)
+HotReload         = false
+HotReloadInterval = 30   # seconds between file modification checks
+
+[Proxy]
+Enabled     = false
+# CSV list of upstreams: "host:port" or "host:port:tls"
+# Example: Upstreams = "10.0.0.1:3000, 10.0.0.2:3000, 10.0.0.3:443:tls"
+Upstreams   = ""
+Prefix      = "/api"
+Strip       = true
+LbMode      = RoundRobin
+HealthCheck = 10
+# Single-upstream fallback (used when Upstreams = "")
+Tls          = false
+Host         = "127.0.0.1"
+UpstreamPort = 3000   # use UpstreamPort (not Port) to avoid clash with [Server] Port
+
+[Static]
+Enabled = false
+Dir     = "./public"
+Prefix  = "/"
+
+[Database]
+# SQLite3 (requires sqlite3.dll in PATH or same directory)
+Enabled = false
+Path    = "warpgate.db"
+
+[RateLimit]
+# Token-bucket rate limiting per client IP
+Enabled = false
+Rps     = 100    # tokens (requests) per second
+Burst   = 200    # maximum burst size
+
+[Auth]
+# JWT validation (HS256 / HMAC-SHA256)
+# Requests to JwtPrefix paths must carry: Authorization: Bearer <jwt>
+JwtEnabled = false
+JwtSecret  = "change-me-to-a-strong-secret"
+JwtPrefix  = "/api"   # leave empty to protect all routes
+
+[Tls]
+# Inbound TLS (SChannel server-side).
+# Thread-pool transport: full async TLS.
+# IOCP transport: TLS connections are handled synchronously within the IOCP worker.
+# HTTP/2 (h2) is automatically offered via ALPN when TLS is enabled.
+Enabled  = false
+CertFile = "server.pfx"
+CertPass = ""
+
+[Log]
+# Append access log lines to a file in addition to stdout.
+# Format: [YYYY-MM-DD HH:MM:SS.mmm] IP METHOD /path STATUS latencyMs
+# Leave File empty to disable file logging.
+File = ""   # e.g. "access.log"

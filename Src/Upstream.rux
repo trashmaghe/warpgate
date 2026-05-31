@@ -1,0 +1,294 @@
+// Warpgate — Multi-upstream pool with round-robin / least-conn load balancing
+// and a background health-checker thread.
+//
+// Config wire format (warpgate.toml):
+//   [Proxy]
+//   Upstreams = "10.0.0.1:3000, 10.0.0.2:3000, 10.0.0.3:443:tls"
+//   LbMode    = LeastConn     # or RoundRobin (default)
+//   HealthCheck = 10          # seconds between health-check attempts
+//
+// Backward-compat: if Upstreams is absent, falls back to Host + Port + Tls.
+
+// ── LbMode ───────────────────────────────────────────────────────────────────
+
+const LB_ROUND_ROBIN: int = 0;
+const LB_LEAST_CONN:  int = 1;
+
+// ── UpstreamDef ───────────────────────────────────────────────────────────────
+
+struct UpstreamDef {
+    host:     [char8; 64],
+    host_len: int,
+    port:     uint16,
+    tls:      bool,
+    // Mutable fields — guarded by slot_lock in UpstreamPool.
+    healthy:  bool,
+    active:   int,    // in-flight request count (least-conn weight)
+}
+
+// ── UpstreamPool ──────────────────────────────────────────────────────────────
+
+struct UpstreamPool {
+    upstreams:    [UpstreamDef; 8],
+    count:        int,
+    rr_idx:       int,          // round-robin cursor
+    lb_mode:      int,          // LB_ROUND_ROBIN or LB_LEAST_CONN
+    health_interval_ms: uint32,
+    lock:         [uint8; 40],  // CRITICAL_SECTION — protects rr_idx + all UpstreamDef fields
+}
+
+// ── Upstream string parser ────────────────────────────────────────────────────
+
+// Parses one "host:port" or "host:port:tls" token (null-terminated) into def.
+// Returns false if malformed.
+func ParseUpstreamToken(tok: *char8, tok_len: int, def: *UpstreamDef) -> bool {
+    if tok_len == 0 { return false; }
+
+    // Find first ':'
+    var colon1: int = -1;
+    var i: int = 0;
+    loop {
+        if i >= tok_len { break; }
+        if tok[i] == c8':'[0] { colon1 = i; break; }
+        i = i + 1;
+    }
+    if colon1 <= 0 { return false; }
+
+    let host_len = colon1;
+    MemCopy(&def.host as *char8, tok, host_len);
+    def.host[host_len] = 0 as char8;
+    def.host_len = host_len;
+
+    // Find second ':' (optional, for :tls flag)
+    var colon2: int = -1;
+    i = colon1 + 1;
+    loop {
+        if i >= tok_len { break; }
+        if tok[i] == c8':'[0] { colon2 = i; break; }
+        i = i + 1;
+    }
+
+    let port_end = if colon2 > 0 { colon2 } else { tok_len };
+    var port_buf: [char8; 8] = [0; 8];
+    let port_len = port_end - colon1 - 1;
+    if port_len <= 0 || port_len > 5 { return false; }
+    MemCopy(&port_buf as *char8, tok + colon1 + 1, port_len);
+    port_buf[port_len] = 0 as char8;
+    def.port = Atoi(&port_buf as *char8) as uint16;
+
+    def.tls = false;
+    if colon2 > 0 {
+        let flag_len = tok_len - colon2 - 1;
+        if flag_len == 3 && MemEqCI(tok + colon2 + 1, c8"tls".data, 3) {
+            def.tls = true;
+        }
+    }
+
+    def.healthy = true;
+    def.active  = 0;
+    return def.port > 0;
+}
+
+// Parses the Upstreams CSV string and fills pool.upstreams[].
+// Skips entries that fail to parse.
+func ParseUpstreamsCSV(csv: *char8, csv_len: int, pool: *UpstreamPool) {
+    var start: int = 0;
+    var i: int = 0;
+    loop {
+        if i > csv_len { break; }
+        let at_end = (i == csv_len);
+        let at_comma = !at_end && csv[i] == c8','[0];
+        if at_end || at_comma {
+            // Trim whitespace around token
+            var ts: int = start;
+            var te: int = i;
+            loop {
+                if ts >= te { break; }
+                if csv[ts] != c8' '[0] && csv[ts] != c8'\t'[0] { break; }
+                ts = ts + 1;
+            }
+            loop {
+                if te <= ts { break; }
+                if csv[te-1] != c8' '[0] && csv[te-1] != c8'\t'[0] { break; }
+                te = te - 1;
+            }
+            let tok_len = te - ts;
+            if tok_len > 0 && pool.count < MAX_UPSTREAMS {
+                let def: *UpstreamDef = &pool.upstreams[pool.count] as *UpstreamDef;
+                if ParseUpstreamToken(csv + ts, tok_len, def) {
+                    pool.count = pool.count + 1;
+                }
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// ── Load-balancing selection ──────────────────────────────────────────────────
+
+// Returns index of selected upstream, or -1 if all are down.
+func SelectUpstream(pool: *UpstreamPool) -> int {
+    EnterCriticalSection(&pool.lock as *opaque);
+
+    if pool.count == 0 {
+        LeaveCriticalSection(&pool.lock as *opaque);
+        return -1;
+    }
+
+    var chosen: int = -1;
+
+    if pool.lb_mode == LB_LEAST_CONN {
+        var min_active: int = 0x7FFFFFFF;
+        var i: int = 0;
+        loop {
+            if i >= pool.count { break; }
+            let up: *UpstreamDef = &pool.upstreams[i] as *UpstreamDef;
+            if up.healthy && up.active < min_active {
+                min_active = up.active;
+                chosen = i;
+            }
+            i = i + 1;
+        }
+    } else {
+        // Round-robin: advance cursor until we find a healthy upstream.
+        var tries: int = 0;
+        loop {
+            if tries >= pool.count { break; }
+            let idx = pool.rr_idx % pool.count;
+            pool.rr_idx = pool.rr_idx + 1;
+            let up: *UpstreamDef = &pool.upstreams[idx] as *UpstreamDef;
+            if up.healthy {
+                chosen = idx;
+                break;
+            }
+            tries = tries + 1;
+        }
+    }
+
+    if chosen >= 0 {
+        let up: *UpstreamDef = &pool.upstreams[chosen] as *UpstreamDef;
+        up.active = up.active + 1;
+    }
+
+    LeaveCriticalSection(&pool.lock as *opaque);
+    return chosen;
+}
+
+// Call after a request to upstream[idx] finishes. ok=false marks unhealthy.
+func ReleaseUpstream(pool: *UpstreamPool, idx: int, ok: bool) {
+    if idx < 0 || idx >= pool.count { return; }
+    EnterCriticalSection(&pool.lock as *opaque);
+    let up: *UpstreamDef = &pool.upstreams[idx] as *UpstreamDef;
+    if up.active > 0 { up.active = up.active - 1; }
+    if !ok { up.healthy = false; }
+    LeaveCriticalSection(&pool.lock as *opaque);
+}
+
+// ── Health checker ────────────────────────────────────────────────────────────
+
+// Background thread: periodically probes each upstream with a TCP connect.
+// Marks upstream healthy/unhealthy based on whether connect succeeds.
+@[Export]
+func HealthCheckerThread(param: *opaque) -> uint32 {
+    let pool = param as *UpstreamPool;
+
+    loop {
+        Sleep(pool.health_interval_ms);
+
+        var i: int = 0;
+        loop {
+            if i >= pool.count { break; }
+
+            // Read upstream fields under lock
+            EnterCriticalSection(&pool.lock as *opaque);
+            var host: [char8; 65] = [0; 65];
+            let up: *UpstreamDef = &pool.upstreams[i] as *UpstreamDef;
+            MemCopy(&host as *char8, &up.host as *char8, up.host_len);
+            host[up.host_len] = 0 as char8;
+            let port = up.port;
+            LeaveCriticalSection(&pool.lock as *opaque);
+
+            let ip = ResolveHost(&host as *char8);
+            var alive: bool = false;
+
+            if ip != INADDR_NONE {
+                let probe = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                if probe != INVALID_SOCKET {
+                    var ms: uint32 = 2000;
+                    setsockopt(probe, SOL_SOCKET, SO_SNDTIMEO, &ms as *char8, 4);
+                    setsockopt(probe, SOL_SOCKET, SO_RCVTIMEO, &ms as *char8, 4);
+
+                    var up_addr: SockAddrIn = SockAddrIn {
+                        sin_family: AF_INET as uint16,
+                        sin_port:   htons(port),
+                        sin_addr:   ip,
+                        sin_zero:   [0; 8],
+                    };
+
+                    if connect(probe, &up_addr as *opaque, 16) == 0 {
+                        alive = true;
+                    }
+                    closesocket(probe);
+                }
+            }
+
+            EnterCriticalSection(&pool.lock as *opaque);
+            let up2: *UpstreamDef = &pool.upstreams[i] as *UpstreamDef;
+            let was = up2.healthy;
+            up2.healthy = alive;
+            LeaveCriticalSection(&pool.lock as *opaque);
+
+            // Log state transitions
+            if was && !alive {
+                var msg: [char8; 128] = [0; 128];
+                var p: int = 0;
+                MemCopy(&msg as *char8 + p, c8"[health] upstream ".data, 18); p = p + 18;
+                MemCopy(&msg as *char8 + p, &host as *char8, up.host_len); p = p + up.host_len;
+                MemCopy(&msg as *char8 + p, c8" went DOWN\n".data, 11); p = p + 11;
+                Log(&msg as *char8, p as uint64);
+            }
+            if !was && alive {
+                var msg2: [char8; 128] = [0; 128];
+                var p2: int = 0;
+                MemCopy(&msg2 as *char8 + p2, c8"[health] upstream ".data, 18); p2 = p2 + 18;
+                MemCopy(&msg2 as *char8 + p2, &host as *char8, up.host_len); p2 = p2 + up.host_len;
+                MemCopy(&msg2 as *char8 + p2, c8" came UP\n".data, 9); p2 = p2 + 9;
+                Log(&msg2 as *char8, p2 as uint64);
+            }
+
+            i = i + 1;
+        }
+    }
+
+    return 0;
+}
+
+func InitUpstreamPool(pool: *UpstreamPool,
+                      csv: *char8, csv_len: int,
+                      lb_mode: int,
+                      health_interval_s: int) {
+    pool.count   = 0;
+    pool.rr_idx  = 0;
+    pool.lb_mode = lb_mode;
+    pool.health_interval_ms =
+        (if health_interval_s <= 0 { DEFAULT_HEALTH_INTERVAL_S }
+         else { health_interval_s }) as uint32 * 1000;
+
+    InitializeCriticalSection(&pool.lock as *opaque);
+
+    if csv_len > 0 {
+        ParseUpstreamsCSV(csv, csv_len, pool);
+    }
+}
+
+func SpawnHealthChecker(pool: *UpstreamPool) -> bool {
+    if pool.count == 0 { return true; }
+    var tid: uint32 = 0;
+    let th = CreateThread(0 as *opaque, 0,
+                          HealthCheckerThread as *opaque,
+                          pool as *opaque, 0, &tid);
+    if th == 0 { return false; }
+    CloseHandle(th);
+    return true;
+}
